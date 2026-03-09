@@ -29,16 +29,16 @@ All artifacts are **real**: IR snapshots, TIR, tuning records, and generated cod
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Server (NVIDIA desktop or WSL2)                                 │
-│  Python · PyTorch · TVM · CUDA                                    │
-│  Gradio app (app.py) on 0.0.0.0:7860                             │
-│  Optional: ngrok / Cloudflare Tunnel → public URL                  │
+│  Server (NVIDIA desktop or WSL2)                                │
+│  Python · PyTorch · TVM · CUDA                                  │
+│  Gradio app (app.py) on 0.0.0.0:7860                            │
+│  Optional: ngrok / Cloudflare Tunnel → public URL               │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼  HTTP
 ┌─────────────────────────────────────────────────────────────────┐
-│  Client (any device with a browser)                               │
-│  Tabs 1–11: run stages, view IR, graphs, tuning, comparison      │
+│  Client (any device with a browser)                             │
+│  Tabs 1–11: run stages, view IR, graphs, tuning, comparison     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
