@@ -1,0 +1,13 @@
+# PyTorch with CUDA 12.8 (install with):
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+# For CPU-only PyTorch, omit --extra-index-url (pip will use PyPI).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch>=2.2
+torchvision>=0.17
+numpy
+Pillow
+gradio>=4.0
+graphviz
+networkx
+matplotlib
+pandas
