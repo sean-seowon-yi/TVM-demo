@@ -24,6 +24,8 @@ wheels/
 
 # TVM / tuning
 tuning_logs/
+precompute_tuning_logs/
+test_tuning_logs/
 *.log
 
 # Environment

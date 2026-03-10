@@ -16,10 +16,10 @@ The demo runs on a machine with an **NVIDIA GPU** (or CPU fallback) and is acces
 4. **Applies graph-level passes** (LegalizeOps, AnnotateTIROpPattern, FuseOps, FuseTIR, DeadCodeElimination) and shows **before/after IR** for each pass.
 5. **Extracts lowered TIR operators** (PrimFuncs) and lets you inspect **TensorIR source** and **loop AST** for any operator.
 6. **Demonstrates Tensor Expressions** with a standalone conv2d “microscope” (compute vs. schedule separation).
-7. **Extracts tuning tasks** with MetaSchedule and runs **automated schedule search** (candidate schedules, convergence chart).
-8. **Selects the best candidate** and explains the **cost model** (structural features, paper Section 5.2).
-9. **Builds the final CUDA module** (with DLight default GPU scheduling when MetaSchedule is unavailable).
-10. **Runs TVM inference** and **compares** predictions and latency to PyTorch.
+7. **Extracts tuning tasks** with MetaSchedule and runs **automated schedule search** (per-task candidate schedules, convergence chart).
+8. **Summarizes tuned tasks** with per-task best schedules and coverage (which operators actually got optimized).
+9. **Explains the cost model** for the selected best candidates (structural features, paper Section 5.2).
+10. **Builds the final CUDA module** (with DLight default GPU scheduling when MetaSchedule is unavailable) and **runs TVM inference**, comparing predictions and latency to PyTorch.
 
 All artifacts are **real**: IR snapshots, TIR, tuning records, and generated code come from TVM and PyTorch; the app is the “microscope” that makes them visible.
 
@@ -44,7 +44,7 @@ All artifacts are **real**: IR snapshots, TIR, tuning records, and generated cod
 
 - **Backend** (`src/backend/pipeline.py`): Stateless stage functions (load model, trace, import, passes, extract ops, TIR, TE microscope, tuning, build, inference).
 - **State** (`src/backend/state.py`): Single `DemoState` object holding all artifacts so tabs can reuse results without recomputation.
-- **Viz** (`src/viz/`): Graph rendering (FX/Relax), IR display/diff, schedule cards, feature tables, latency/convergence charts.
+- **Viz** (`src/viz/`): Graph rendering (FX/Relax), IR display/diff, per-task schedule cards and summaries, feature tables, latency/convergence charts.
 - **App** (`app.py`): Gradio Blocks with 11 tabs, progress badges, “Run All” and per-tab “Run Stage” buttons.
 
 ---
@@ -172,9 +172,9 @@ The app has **11 tabs**. Each tab corresponds to one or more **pipeline stages**
 | **5. Extracted Operators** | 5 | Table of TIR operators (name, shapes, op kind, block count); expandable TIR source | §3 → §4 |
 | **6. TensorIR / AST** | 6 | Per-PrimFunc TIR source, block/loop/buffer AST tree, loop table (extent, bindings) | §4, Fig. 13 |
 | **7. Tensor Expression** | 7 | Standalone conv2d TE compute, naive lowered TIR, and short explanation of compute/schedule separation | §4.1, Fig. 5 |
-| **8. Schedule Search** | 8–9 | Extracted tuning tasks, MetaSchedule tuning (or synthetic fallback), candidate cards, convergence chart, task-weight pie | §5.1, §5.3, Fig. 12 |
-| **9. Cost Model** | 10 | Best candidate banner, structural features table, cost-model explanation (paper §5.2, Fig. 13) | §5.2, Fig. 13 |
-| **10. Build & Results** | 11–12 | Target string, built module, TVM top-5, correctness (max diff, cosine sim), latency bar chart (PyTorch vs TVM), optional CUDA source | Fig. 2 bottom, §6, Fig. 14 |
+| **8. Schedule Search** | 8–9 | Extracted tuning tasks, MetaSchedule tuning (or synthetic fallback), per-task candidate cards, convergence chart, per-task coverage | §5.1, §5.3, Fig. 12 |
+| **9. Cost Model** | 10 | Structural features table and cost-model explanation for the chosen best candidates (paper §5.2, Fig. 13) | §5.2, Fig. 13 |
+| **10. Build & Results** | 11–12 | Side-by-side predictions (PyTorch vs TVM), correctness verdict, 3-bar latency chart (PyTorch vs TVM live vs TVM precomputed), speedup, optional CUDA source | Fig. 2 bottom, §6, Fig. 14 |
 | **11. Pipeline Timeline** | 13 | Full pipeline as a vertical timeline with status and paper refs per stage | Fig. 2 (overview) |
 
 ---
@@ -187,6 +187,8 @@ TVM-demo/
 ├── PLAN.md                   # Full implementation plan and paper mapping
 ├── requirements.txt          # Python deps (PyTorch, Gradio, graphviz, etc.); TVM separate
 ├── app.py                    # Gradio entry point (tabs, buttons, state wiring)
+├── precomputed_results.json  # High-trial tuning results (shown in Tab 10 without re-running)
+├── precompute_results.py     # Script to generate precomputed_results.json with real numbers
 ├── _find_nvcc.py             # Helper to locate nvcc for TVM build
 ├── _tune_probe.py            # Tuning / MetaSchedule probe script
 ├── src/
@@ -197,9 +199,9 @@ TVM-demo/
 │   ├── viz/
 │   │   ├── graph_render.py   # FX graph and Relax call graph → SVG
 │   │   ├── ir_display.py     # IR formatting, diff, TIR AST tree/loop tables
-│   │   ├── schedule_display.py  # Schedule trace → readable cards, best-candidate banner
+│   │   ├── schedule_display.py  # Schedule trace → per-task candidate cards and summary table
 │   │   ├── feature_table.py  # Structural features, cost-model explanation HTML
-│   │   └── charts.py        # Latency comparison, convergence chart, task-weight pie
+│   │   └── charts.py        # Latency comparison, convergence chart, per-task coverage, tuning scatter
 │   ├── docs/
 │   │   ├── PHASE1.md … PHASE4.md  # Implementation phases (core pipeline → viz → tuning → Gradio)
 │   └── tests/
@@ -221,8 +223,8 @@ TVM-demo/
 - **Stage 6**: For a chosen PrimFunc: TIR source and AST summary (blocks, loops, buffers).
 - **Stage 7**: Build a small TE/TOPI conv2d, show compute declaration and naive lowered TIR (microscope).
 - **Stage 8**: MetaSchedule task extraction (or manual extraction); list of tunable tasks and target.
-- **Stage 9**: Run tuning (or synthetic records if tuning unavailable); candidate cards and convergence data.
-- **Stage 10**: Select best candidate by measured latency; structural features table; cost-model explanation.
+- **Stage 9**: Run tuning (or synthetic records if tuning unavailable); per-task candidate cards, convergence data, and task coverage summary.
+- **Stage 10**: Select best candidates by measured latency and explain the cost model; structural features table; cost-model explanation.
 - **Stage 11**: Bind params, apply DLight if needed, build Relax module for CUDA (or LLVM); optionally capture generated CUDA source.
 - **Stage 12**: Run TVM inference, compare logits to PyTorch (max abs diff, cosine similarity), compare latency.
 - **Stage 13**: Timeline view of all stages and paper references.
@@ -243,9 +245,10 @@ Use `--cpu` to run only PyTorch-only stages on CPU (no TVM/CUDA). The full run e
 
 ## Tuning and Performance
 
-- **Tuning trials**: The “Tuning Trials” slider (default 32, range 4–128) sets the MetaSchedule trial budget for stages 8–9. Higher values can improve performance but take longer.
-- **Tuning logs**: MetaSchedule may write to `tuning_logs/` (database and workload JSON). This directory can be recreated; you can add `tuning_logs/` to `.gitignore` if you don’t want to commit it.
-- **Fallbacks**: If MetaSchedule is unavailable (e.g. no `tvm.meta_schedule` or `tvm.s_tir.meta_schedule`), the app can use synthetic tuning records and still build and run with DLight default GPU scheduling so stages 8–12 remain functional.
+- **Tuning trials**: The slider defaults to **8 trials** (range 4-128) so the live demo stays fast (~1 min). Higher values improve performance but take longer.
+- **Precomputed high-trial results**: `precomputed_results.json` stores results from a longer tuning run (e.g. 128 trials). Tab 10 shows a **3-bar chart** (PyTorch vs TVM live vs TVM precomputed) to demonstrate how more tuning yields faster kernels -- without waiting during the presentation. Generate your own: `~/tvm_env/bin/python precompute_results.py --trials 128`
+- **Tuning logs**: MetaSchedule writes to `tuning_logs/` (in `.gitignore`).
+- **Fallbacks**: If MetaSchedule is unavailable, the app uses synthetic tuning records and DLight default GPU scheduling so stages 8-12 remain functional.
 
 ---
 

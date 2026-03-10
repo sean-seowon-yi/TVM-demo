@@ -1,0 +1,13 @@
+{
+    "resnet18": {
+        "tuning_trials": 538,
+        "tvm_latency_ms": 1.5858,
+        "pytorch_latency_ms": 2.6773,
+        "speedup": 1.69,
+        "max_abs_diff": 0.0031747817993164062,
+        "cosine_similarity": 0.9999999521318261,
+        "top1_class": "Egyptian cat",
+        "target": "{\"kind\":\"cuda\",\"tag\":\"\",\"keys\":[\"cuda\",\"gpu\"],\"max_num_threads\":1024,\"thread_warp_size\":32,\"max_shared_memory_per_block\":49152,\"max_threads_per_block\":1024,\"arch\":\"sm_86\"}"
+    },
+    "_comment": "Precomputed high-trial results. Update by running precompute_results.py."
+}

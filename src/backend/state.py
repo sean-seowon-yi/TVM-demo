@@ -106,6 +106,11 @@ class DemoState:
     # ------------------------------------------------------------------
     tuning_records: List[dict] = field(default_factory=list)
     convergence_data: List[dict] = field(default_factory=list)
+    tuning_work_dir: Optional[str] = None
+    tuning_trials_used: int = 0
+    tuning_tasks_total: int = 0
+    tuning_tasks_covered: int = 0
+    tuning_task_names_covered: List[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # Stage 10 — Cost Model & Selection  (Pass 3)

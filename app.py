@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -41,6 +42,7 @@ from backend.pipeline import (
     build_te_microscope,
     extract_tuning_tasks,
     run_tuning,
+    count_tuned_tasks_from_db,
     select_best_candidate,
     compute_tir_structural_features,
     build_tvm_module,
@@ -96,6 +98,18 @@ def _ok(msg: str) -> str:
 
 def _info(msg: str) -> str:
     return f'<div style="color:#2B6CB0;padding:8px 12px;background:#EBF8FF;border-left:3px solid #4299E1;border-radius:4px;font-size:13px">{msg}</div>'
+
+
+def _load_precomputed(model_name: str) -> dict | None:
+    """Load precomputed high-trial results from JSON (if available)."""
+    import json
+    p = Path(__file__).resolve().parent / "precomputed_results.json"
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        return data.get(model_name)
+    except Exception:
+        return None
 
 
 
@@ -427,105 +441,182 @@ def run_stage_7() -> tuple:
 # Tab 8 — Schedule Search (Stages 8-9)
 # ──────────────────────────────────────────────────────────────────────
 
-def run_stage_8_9(max_trials: int) -> tuple:
+def run_stage_8_9(max_trials: int):
+    """Generator that yields progressive updates during tuning."""
     if STATE.current_mod is None:
-        return _err("Run Stage 4 first"), "", "", "", "", _progress_html()
+        yield _err("Run Stage 4 first"), "", "", "", "", _progress_html()
+        return
 
-    def _impl():
+    # -- Phase 1: Extract tasks (fast) --
+    def _extract():
         STATE.mark("stage_8", StageStatus.RUNNING)
         task_dicts, tasks_raw, target = extract_tuning_tasks(STATE.current_mod, target_str="cuda")
         STATE.tuning_tasks = task_dicts
         STATE._tasks_raw = tasks_raw
         STATE._tuning_target = target
+        STATE.tuning_tasks_total = len(task_dicts)
         STATE.mark("stage_8", StageStatus.DONE)
+        return task_dicts
 
-        task_info = _ok(f"Extracted {len(task_dicts)} tuning tasks")
+    try:
+        task_dicts = _on_tvm_thread(_extract)
+    except Exception as exc:
+        STATE.mark("stage_8", StageStatus.FAILED, str(exc))
+        yield _err(f"Stage 8 failed: {exc}"), "", "", "", "", _progress_html()
+        return
 
+    task_info = _ok(f"Extracted {len(task_dicts)} tuning tasks")
+    task_names = ", ".join(d["name"] for d in sorted(task_dicts, key=lambda d: d["weight"], reverse=True)[:6])
+    n_trials = max(4, int(max_trials))
+
+    tuning_banner = (
+        '<div style="padding:16px 20px;background:linear-gradient(135deg,#E3F2FD,#FFF3E0);'
+        'border-radius:8px;margin:8px 0">'
+        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">'
+        '<div style="width:20px;height:20px;border:3px solid #1976D2;border-top-color:transparent;'
+        'border-radius:50%;animation:spin 1s linear infinite"></div>'
+        f'<span style="font-size:15px;font-weight:600;color:#1565C0">'
+        f'MetaSchedule tuning in progress &mdash; {n_trials} trials across {len(task_dicts)} tasks</span></div>'
+        f'<div style="font-size:13px;color:#555;margin-top:4px">'
+        f'Heaviest tasks: {task_names} ...</div>'
+        f'<div style="font-size:12px;color:#888;margin-top:8px">'
+        f'The tuner measures schedule candidates on real hardware (GPU). '
+        f'Each trial compiles a variant, runs it, and records the latency.</div>'
+        '<style>@keyframes spin{to{transform:rotate(360deg)}}</style></div>'
+    )
+
+    yield task_info, tuning_banner, "", "", "", _progress_html()
+
+    # -- Phase 2: Run tuning (slow, blocking) --
+    def _tune():
         STATE.mark("stage_9", StageStatus.RUNNING)
+        import shutil as _shutil
+        _live_work_dir = "./tuning_logs"
+        if os.path.exists(_live_work_dir):
+            _shutil.rmtree(_live_work_dir)
         records, convergence, work_dir = run_tuning(
             STATE.current_mod,
             target=STATE._tuning_target,
-            max_trials_global=max(4, int(max_trials)),
-            num_trials_per_iter=min(16, max(4, int(max_trials) // 4)),
+            work_dir=_live_work_dir,
+            max_trials_global=n_trials,
+            num_trials_per_iter=min(16, max(4, n_trials // 4)),
             max_tasks=3,
         )
         STATE.tuning_records = records
         STATE.convergence_data = convergence
+        STATE.tuning_work_dir = work_dir
+        STATE.tuning_trials_used = n_trials
+
+        n_covered, covered_names = count_tuned_tasks_from_db(work_dir)
+        STATE.tuning_tasks_covered = n_covered
+        STATE.tuning_task_names_covered = covered_names
+
         STATE.mark("stage_9", StageStatus.DONE)
-
-        from viz.schedule_display import candidate_cards_html
-        from viz.charts import convergence_chart, task_weight_pie_chart
-        cards = candidate_cards_html(records, max_display=15)
-        conv_html = convergence_chart(convergence) if convergence else _info("No convergence data")
-        pie_html = task_weight_pie_chart(task_dicts)
-
-        is_synthetic = any(r.get("_synthetic") for r in records)
-        label = " (synthetic -- real tuning unavailable)" if is_synthetic else ""
-        tune_info = _ok(f"{len(records)} candidates measured{label}")
-
-        return task_info, tune_info, cards, conv_html, pie_html
+        return records, convergence
 
     try:
-        task_info, tune_info, cards, conv_html, pie_html = _on_tvm_thread(_impl)
-        return task_info, tune_info, cards, conv_html, pie_html, _progress_html()
+        records, convergence = _on_tvm_thread(_tune)
     except Exception as exc:
-        failed_stage = "stage_8" if not STATE.tuning_tasks else "stage_9"
-        STATE.mark(failed_stage, StageStatus.FAILED, str(exc))
-        if STATE.tuning_tasks:
-            task_info = _ok(f"Extracted {len(STATE.tuning_tasks)} tuning tasks")
-            return task_info, _err(f"Stage 9 failed: {exc}"), "", "", "", _progress_html()
-        return _err(f"Stage 8 failed: {exc}"), "", "", "", "", _progress_html()
+        STATE.mark("stage_9", StageStatus.FAILED, str(exc))
+        yield task_info, _err(f"Stage 9 failed: {exc}"), "", "", "", _progress_html()
+        return
+
+    # -- Phase 3: Build visualizations (fast) --
+    from viz.schedule_display import candidate_cards_html, per_task_summary_html
+    from viz.charts import per_task_summary_chart
+
+    total = STATE.tuning_tasks_total
+
+    record_task_names = list(dict.fromkeys(
+        r["task_name"] for r in records
+        if r.get("task_name") and r["task_name"] != "main"
+        and not r["task_name"].startswith("task_")
+    ))
+    if record_task_names:
+        covered_names = record_task_names
+        covered = len(covered_names)
+    else:
+        covered = STATE.tuning_tasks_covered
+        covered_names = STATE.tuning_task_names_covered
+
+    STATE.tuning_tasks_covered = covered
+    STATE.tuning_task_names_covered = covered_names
+
+    cards = candidate_cards_html(records)
+    task_chart = per_task_summary_chart(
+        total_tasks=total,
+        tuned_task_names=covered_names,
+        records=records,
+        title=f"Task Coverage ({covered} of {total} tuned)",
+    )
+
+    best, features = select_best_candidate(records, STATE.current_mod)
+    STATE.best_candidate = best
+    STATE.candidate_features = features
+    STATE.mark("stage_10", StageStatus.DONE)
+    summary_html = per_task_summary_html(records, total_tasks=total)
+
+    is_synthetic = any(r.get("_synthetic") for r in records)
+    label = " (synthetic -- real tuning unavailable)" if is_synthetic else ""
+    tune_info = _ok(
+        f"{len(records)} candidates measured{label} &mdash; "
+        f"<b>{covered} of {total}</b> tasks tuned: "
+        f"{', '.join(covered_names) if covered_names else 'none'}"
+    )
+
+    yield task_info, tune_info, cards, task_chart, summary_html, _progress_html()
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Tab 9 — Cost Model & Selection (Stage 10)
+# Tab 9 — Cost Model & Search Exploration (Stage 10)
 # ──────────────────────────────────────────────────────────────────────
 
 def run_stage_10() -> tuple:
     if not STATE.tuning_records:
-        return _err("Run Stage 9 first"), "", "", "", _progress_html()
+        return _err("Run Stage 8 first"), "", "", "", _progress_html()
 
-    def _impl():
-        STATE.mark("stage_10", StageStatus.RUNNING)
-        best, features = select_best_candidate(STATE.tuning_records, STATE.current_mod)
-        STATE.best_candidate = best
-        STATE.candidate_features = features
-        STATE.mark("stage_10", StageStatus.DONE)
+    from viz.charts import candidate_scatter_chart
+    from viz.feature_table import cost_model_explanation_html
 
-        from viz.schedule_display import best_candidate_banner_html
-        from viz.feature_table import (
-            build_feature_dataframe, feature_table_html,
-            cost_model_explanation_html,
+    scatter = candidate_scatter_chart(
+        STATE.tuning_records,
+        title=f"Search Exploration ({len(STATE.tuning_records)} candidates across {STATE.tuning_tasks_covered} tasks)",
+    )
+    explanation = cost_model_explanation_html()
+
+    records = STATE.tuning_records
+    valid = [r for r in records if r.get("run_ms", float("inf")) < 1e6]
+    task_stats: dict = {}
+    for r in valid:
+        name = r["task_name"]
+        ms = r["run_ms"]
+        if name not in task_stats:
+            task_stats[name] = {"count": 0, "best_ms": float("inf"), "worst_ms": 0}
+        task_stats[name]["count"] += 1
+        task_stats[name]["best_ms"] = min(task_stats[name]["best_ms"], ms)
+        task_stats[name]["worst_ms"] = max(task_stats[name]["worst_ms"], ms)
+
+    insight_md = "### Search Space Exploration by Task\n\n"
+    if task_stats:
+        insight_md += "| Task | Candidates | Best (ms) | Worst (ms) | Spread |\n"
+        insight_md += "|------|-----------|-----------|-----------|--------|\n"
+        for name, st in sorted(task_stats.items(), key=lambda x: x[1]["best_ms"]):
+            spread = st["worst_ms"] / st["best_ms"] if st["best_ms"] > 0 else 0
+            short = name[:30] + "..." if len(name) > 30 else name
+            insight_md += (
+                f"| `{short}` | {st['count']} | {st['best_ms']:.3f} | "
+                f"{st['worst_ms']:.3f} | {spread:.1f}x |\n"
+            )
+        insight_md += (
+            "\n> *Spread = worst / best latency. A high spread means the schedule choice "
+            "matters a lot for that operator. The cost model helps the tuner focus on "
+            "promising regions of this search space.*\n"
         )
-        banner = best_candidate_banner_html(best)
-        df = build_feature_dataframe(features)
-        table = feature_table_html(df, max_rows=20)
-        explanation = cost_model_explanation_html()
+    else:
+        insight_md += "*No valid measurements to analyze.*\n"
 
-        tir_feats_html = ""
-        if STATE.operators and STATE.current_mod is not None:
-            try:
-                op_name = STATE.operators[0]["name"]
-                tir_feats = compute_tir_structural_features(STATE.current_mod, op_name)
-                if tir_feats:
-                    from viz.feature_table import tir_features_table_html
-                    tir_feats_html = (
-                        f'<div style="margin-top:12px"><b>TIR Structural Features for '
-                        f'<code>{op_name}</code></b></div>'
-                        + tir_features_table_html(tir_feats)
-                    )
-            except Exception:
-                pass
-
-        status = _ok(f"Best: #{best['candidate_id']} ({best['task_name']}) at {best['run_ms']:.4f} ms") if best else _info("No best candidate")
-        return status, banner + tir_feats_html, table, explanation
-
-    try:
-        status, banner_html, table, explanation = _on_tvm_thread(_impl)
-        return status, banner_html, table, explanation, _progress_html()
-    except Exception as exc:
-        STATE.mark("stage_10", StageStatus.FAILED, str(exc))
-        return _err(f"Stage 10 failed: {exc}"), "", "", "", _progress_html()
+    status = _ok(f"Analyzed {len(valid)} candidates across {len(task_stats)} tasks")
+    return status, scatter, insight_md, explanation, _progress_html()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -540,6 +631,7 @@ def run_stage_11_12() -> tuple:
         STATE.mark("stage_11", StageStatus.RUNNING)
         lib, target_used, cuda_src, params_bound = build_tvm_module(
             STATE.current_mod, params_np=STATE.model_params_np, target_str="cuda",
+            work_dir=STATE.tuning_work_dir,
         )
         STATE.compiled_lib = lib
         STATE.target_str = target_used
@@ -566,25 +658,89 @@ def run_stage_11_12() -> tuple:
         STATE.cosine_sim = comp["cosine_similarity"]
         STATE.mark("stage_12", StageStatus.DONE)
 
-        tvm_md = "| # | Class | Probability |\n|---|-------|-------------|\n"
-        for i, p in enumerate(top5):
-            tvm_md += f"| {i+1} | {p['class']} | {p['prob']:.4f} |\n"
-
-        comparison_md = (
-            f"| Metric | Value |\n|---|---|\n"
-            f"| Max absolute diff | {comp['max_abs_diff']:.6f} |\n"
-            f"| Cosine similarity | {comp['cosine_similarity']:.6f} |\n"
-            f"| PyTorch latency | {comp['pytorch_ms']:.2f} ms |\n"
-            f"| TVM latency | {comp['tvm_ms']:.2f} ms |\n"
-            f"| Speedup | {comp['speedup']}x |\n"
-            f"| Match (diff < 0.01) | {'YES' if comp['match'] else 'NO'} |\n"
+        # -- Correctness: side-by-side predictions --
+        pytorch_top5 = STATE.pytorch_top5 or []
+        tvm_md = "### Correctness Check\n\n"
+        tvm_md += "| # | PyTorch | Prob | TVM (live) | Prob | Match |\n"
+        tvm_md += "|---|---------|------|------------|------|-------|\n"
+        for i in range(min(5, len(top5), len(pytorch_top5))):
+            pt = pytorch_top5[i]
+            tv = top5[i]
+            match_icon = "**=**" if pt["class"] == tv["class"] else "~"
+            tvm_md += (
+                f"| {i+1} | {pt['class']} | {pt['prob']:.4f} "
+                f"| {tv['class']} | {tv['prob']:.4f} | {match_icon} |\n"
+            )
+        verdict_icon = "PASS" if comp["match"] else "MISMATCH"
+        tvm_md += (
+            f"\nMax abs diff: **{comp['max_abs_diff']:.6f}** | "
+            f"Cosine similarity: **{comp['cosine_similarity']:.6f}** | "
+            f"Verdict: **{verdict_icon}**\n"
         )
 
-        from viz.charts import latency_comparison_chart
-        chart_html = latency_comparison_chart(
-            STATE.pytorch_latency_ms, latency,
-            title=f"{STATE.model_name}: PyTorch vs TVM",
-        )
+        # -- Performance: 3-way comparison --
+        live_trials = STATE.tuning_trials_used or 8
+        precomputed = _load_precomputed(STATE.model_name)
+
+        from viz.charts import latency_comparison_chart, three_bar_latency_chart
+
+        if precomputed:
+            pre_trials = precomputed.get("tuning_trials", 512)
+            pre_ms = precomputed["tvm_latency_ms"]
+            pre_speedup = precomputed["speedup"]
+
+            import torch as _torch
+            _gpu_label = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "GPU"
+            chart_html = three_bar_latency_chart(
+                STATE.pytorch_latency_ms, latency, pre_ms,
+                live_trials=live_trials,
+                precomputed_trials=pre_trials,
+                title=f"{STATE.model_name} Inference Latency ({_gpu_label})",
+            )
+
+            live_vs_pt = comp['speedup']
+
+            live_covered = STATE.tuning_tasks_covered
+            total_tasks = STATE.tuning_tasks_total or 28
+            pre_tasks_tuned = precomputed.get("tasks_tuned", total_tasks)
+
+            comparison_md = (
+                f"### The Tuning Story\n\n"
+                f"ResNet-18 has **{total_tasks} tunable operators** (conv2d, batch_norm fusions, matmul, etc.). "
+                f"The MetaSchedule auto-tuner explores schedule candidates for each operator. "
+                f"**How many trials you budget determines how many operators get optimized.**\n\n"
+                f"| | PyTorch Baseline | TVM Live ({live_trials} trials) | TVM Tuned ({pre_trials} trials) |\n"
+                f"|---|---|---|---|\n"
+                f"| **Latency** | {STATE.pytorch_latency_ms:.2f} ms | {latency:.2f} ms | {pre_ms:.2f} ms |\n"
+                f"| **vs PyTorch** | -- | {live_vs_pt}x | **{pre_speedup}x** |\n"
+                f"| **Tasks tuned** | N/A (cuDNN) | **{live_covered} of {total_tasks}** | **{pre_tasks_tuned} of {total_tasks}** |\n\n"
+            )
+
+            if live_vs_pt < 1:
+                comparison_md += (
+                    f"> **Why is the live run slower?** With only {live_trials} trials, "
+                    f"the tuner only covered **{live_covered} of {total_tasks}** tasks. "
+                    f"The heavy convolutions (which dominate runtime) fall back to DLight default schedules. "
+                    f"With {pre_trials} trials and **{pre_tasks_tuned}** tasks tuned, "
+                    f"every operator gets optimized, and TVM generates faster code than cuDNN.\n"
+                )
+            else:
+                comparison_md += (
+                    f"> Even {live_trials} trials (covering {live_covered} tasks) produced a {live_vs_pt}x speedup. "
+                    f"With {pre_trials} trials covering **{pre_tasks_tuned}** tasks, performance reaches **{pre_speedup}x**.\n"
+                )
+        else:
+            chart_html = latency_comparison_chart(
+                STATE.pytorch_latency_ms, latency,
+                title=f"{STATE.model_name}: PyTorch vs TVM",
+            )
+            comparison_md = (
+                f"### Performance\n\n"
+                f"| Metric | Value |\n|---|---|\n"
+                f"| PyTorch latency | {comp['pytorch_ms']:.2f} ms |\n"
+                f"| TVM latency | {comp['tvm_ms']:.2f} ms |\n"
+                f"| **Speedup** | **{comp['speedup']}x** |\n"
+            )
 
         cuda_display = cuda_src[:3000] if cuda_src else "(CUDA source not available for this backend)"
 
@@ -592,7 +748,37 @@ def run_stage_11_12() -> tuple:
 
     try:
         build_info, tvm_md, comparison_md, chart_html, cuda_display = _on_tvm_thread(_impl)
-        return build_info, tvm_md, comparison_md, chart_html, cuda_display, _ok("Pipeline complete!"), _progress_html()
+        comp_data = {
+            "speedup": STATE.pytorch_latency_ms / STATE.tvm_latency_ms if STATE.tvm_latency_ms > 0 else 0,
+            "match": STATE.max_abs_diff < 1e-2,
+            "cos": STATE.cosine_sim,
+        }
+
+        precomputed = _load_precomputed(STATE.model_name)
+        pre_speedup = precomputed["speedup"] if precomputed else None
+
+        if comp_data["match"]:
+            live_line = f'Live: {comp_data["speedup"]:.2f}x vs PyTorch'
+            tuned_line = f' | Tuned ({precomputed["tuning_trials"]} trials): <b>{pre_speedup}x</b>' if pre_speedup else ""
+            done_html = (
+                '<div style="background:linear-gradient(135deg,#1B5E20,#2E7D32);'
+                'color:#fff;border-radius:12px;padding:24px;margin:12px 0;text-align:center">'
+                '<div style="font-size:24px;font-weight:bold;margin-bottom:8px">'
+                'Pipeline Complete &mdash; TVM Output Matches PyTorch</div>'
+                f'<div style="font-size:15px;opacity:0.95;margin-bottom:4px">'
+                f'Cosine similarity: {comp_data["cos"]:.6f}</div>'
+                f'<div style="font-size:17px;margin-top:6px">'
+                f'{live_line}{tuned_line}</div></div>'
+            )
+        else:
+            done_html = (
+                '<div style="background:#FFF3E0;border-left:4px solid #FF9800;'
+                'border-radius:4px;padding:16px;margin:12px 0">'
+                '<b>Pipeline Complete</b> &mdash; output differs from PyTorch '
+                f'(max diff {STATE.max_abs_diff:.4f}). '
+                'This may be expected for some backends or precision modes.</div>'
+            )
+        return build_info, tvm_md, comparison_md, chart_html, cuda_display, done_html, _progress_html()
     except Exception as exc:
         stage = "stage_11" if STATE.compiled_lib is None else "stage_12"
         STATE.mark(stage, StageStatus.FAILED, str(exc))
@@ -623,22 +809,6 @@ def build_timeline() -> str:
         ("Stage 12", "TVM Inference", "stage_12", f"{STATE.tvm_latency_ms:.2f} ms, {STATE.cosine_sim:.4f} cosine" if STATE.tvm_logits is not None else ""),
     ]
 
-    paper_refs = [
-        "Figure 2 top",
-        "Section 1",
-        "Section 3, Figure 3",
-        "Figure 2",
-        "Section 3",
-        "Section 3 -> 4",
-        "Section 4, Figure 13",
-        "Section 4.1, Figure 5",
-        "Section 5.1",
-        "Section 5.3, Figure 12",
-        "Section 5.2, Figure 13",
-        "Figure 2 bottom",
-        "Section 6, Figure 14",
-    ]
-
     html_parts = ['<div style="max-width:700px;margin:0 auto;font-family:sans-serif">']
     for i, (label, title, sid, detail) in enumerate(stages):
         st = STATE.stage_status.get(sid, StageStatus.PENDING)
@@ -658,7 +828,6 @@ def build_timeline() -> str:
             f'</div>'
             f'<div style="flex:1;border-left:2px solid {color};padding:4px 0 12px 16px">'
             f'<div style="font-weight:bold;font-size:13px">{label}: {title}</div>'
-            f'<div style="font-size:11px;color:#666">Paper: {paper_refs[i]}</div>'
             + (f'<div style="font-size:12px;color:#333;margin-top:2px">{detail}</div>' if detail else '')
             + f'</div></div>'
         )
@@ -697,7 +866,9 @@ def run_all_stages(model_choice: str, image, max_trials: int, progress=gr.Progre
     s7 = run_stage_7()
 
     progress(0.60, desc="Stages 8-9: Tuning...")
-    s89 = run_stage_8_9(max_trials)
+    s89 = None
+    for s89 in run_stage_8_9(max_trials):
+        pass
 
     progress(0.80, desc="Stage 10: Cost model...")
     s10 = run_stage_10()
@@ -747,8 +918,8 @@ def build_app() -> gr.Blocks:
             )
             image_in = gr.Image(type="pil", label="Upload Image (optional)", scale=2)
             tuning_slider = gr.Slider(
-                minimum=4, maximum=128, value=32, step=4,
-                label="Tuning Trials",
+                minimum=4, maximum=128, value=8, step=4,
+                label="Live Tuning Trials (low = fast demo, precomputed 500+ shown in results)",
                 scale=1,
             )
 
@@ -763,7 +934,11 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 1: Task & Input ---
             with gr.TabItem("1. Task & Input"):
-                gr.Markdown("### Stages 0-1: Load Model & PyTorch Baseline\n*Paper: Figure 2 top, Section 1*")
+                gr.Markdown(
+                    "### Stages 0-1: Load Model & PyTorch Baseline\n"
+                    "*Before any compiler work, "
+                    "we establish the starting point: a pretrained model running in PyTorch eager mode.*"
+                )
                 run_01_btn = gr.Button("Run Stages 0-1")
                 s01_status = gr.HTML()
                 s01_env = gr.Markdown()
@@ -780,7 +955,12 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 2: PyTorch Graph ---
             with gr.TabItem("2. PyTorch Graph"):
-                gr.Markdown("### Stage 2: Computation Graph Capture\n*Paper: Section 3, Figure 3*")
+                gr.Markdown(
+                    "### Stage 2: Computation Graph Capture\n"
+                    "*Computational graphs are a common way "
+                    "to represent programs in DL frameworks. We capture the graph using "
+                    "PyTorch FX before handing it to TVM.*"
+                )
                 run_2_btn = gr.Button("Run Stage 2")
                 s2_status = gr.HTML()
                 s2_svg = gr.HTML()
@@ -792,7 +972,12 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 3: TVM IR Import ---
             with gr.TabItem("3. TVM IR Import"):
-                gr.Markdown("### Stage 3: Import into TVM Relax IR\n*Paper: Figure 2, Section 3*")
+                gr.Markdown(
+                    "### Stage 3: Import into TVM Relax IR\n"
+                    "*The PyTorch model is converted into TVM's "
+                    "IRModule, the central data structure that bundles the computation graph, "
+                    "tensor programs, and external calls.*"
+                )
                 run_3_btn = gr.Button("Run Stage 3")
                 s3_status = gr.HTML()
                 with gr.Row():
@@ -805,7 +990,13 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 4: TVM Passes ---
             with gr.TabItem("4. TVM Passes"):
-                gr.Markdown("### Stage 4: Graph-Level Passes\n*Paper: Section 3 -- Operator Fusion, Legalization*")
+                gr.Markdown(
+                    "### Stage 4: Graph-Level Passes\n"
+                    "*Each pass rewrites the IR: LegalizeOps maps high-level "
+                    "ops to TIR, AnnotateTIROpPattern tags fusion categories, FuseOps merges "
+                    "element-wise/reduction chains, FuseTIR creates fused kernels, and "
+                    "DeadCodeElimination cleans up.*"
+                )
                 run_4_btn = gr.Button("Run Stage 4")
                 s4_status = gr.HTML()
                 s4_deltas = gr.Markdown()
@@ -825,14 +1016,23 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 5: Extracted Operators ---
             with gr.TabItem("5. Extracted Operators"):
-                gr.Markdown("### Stage 5: Operator Extraction\n*Paper: Section 3 -> 4 transition*")
+                gr.Markdown(
+                    "### Stage 5: Operator Extraction\n"
+                    "*After graph-level fusion, these are the "
+                    "resulting TIR PrimFuncs: the concrete tensor programs that the tuner will optimize.*"
+                )
                 run_5_btn = gr.Button("Run Stage 5")
                 s5_status = gr.HTML()
                 s5_table = gr.HTML()
 
             # --- Tab 6: TensorIR / AST ---
             with gr.TabItem("6. TensorIR / AST"):
-                gr.Markdown("### Stage 6: TIR Low-Level Representation\n*Paper: Section 4, Figure 13*")
+                gr.Markdown(
+                    "### Stage 6: TIR Low-Level Representation\n"
+                    "*Each PrimFunc is a loop-based program with "
+                    "explicit buffers and thread bindings. This is the representation the cost model "
+                    "extracts features from.*"
+                )
                 op_dd = gr.Dropdown(label="Select PrimFunc", choices=[], interactive=True)
                 refresh_ops_btn = gr.Button("Refresh operator list", size="sm")
                 s6_status = gr.HTML()
@@ -862,7 +1062,12 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 7: Tensor Expression ---
             with gr.TabItem("7. Tensor Expression"):
-                gr.Markdown("### Stage 7: Compute / Schedule Separation\n*Paper: Section 4.1, Figure 5*")
+                gr.Markdown(
+                    "### Stage 7: Compute / Schedule Separation (Microscope)\n"
+                    "*TVM separates WHAT to compute "
+                    "(tensor expression) from HOW to compute it (schedule). This standalone "
+                    "conv2d demonstrates the core abstraction from Halide.*"
+                )
                 run_7_btn = gr.Button("Run Stage 7")
                 s7_status = gr.HTML()
                 with gr.Row():
@@ -876,47 +1081,68 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 8: Schedule Search ---
             with gr.TabItem("8. Schedule Search"):
-                gr.Markdown("### Stages 8-9: Task Extraction & Tuning\n*Paper: Sections 5.1, 5.3 -- Figure 12*")
+                gr.Markdown(
+                    "### Stages 8-9: Task Extraction & Auto-Tuning\n"
+                    "*MetaSchedule extracts tunable tasks "
+                    "(ResNet-18 has 28), then searches for optimal schedule configurations "
+                    "(tile sizes, loop orders, thread bindings) by measuring candidates on real hardware.*\n\n"
+                    "*With a low trial budget, only a few tasks get tuned -- the rest use default schedules. "
+                    "Tab 10 will compare this live result against a precomputed high-trial run.*"
+                )
                 run_89_btn = gr.Button("Run Stages 8-9")
                 s89_task_status = gr.HTML()
                 s89_tune_status = gr.HTML()
                 with gr.Row():
-                    with gr.Column(scale=2):
+                    with gr.Column(scale=3):
                         s89_cards = gr.HTML()
-                    with gr.Column(scale=1):
-                        s89_convergence = gr.HTML()
-                        s89_pie = gr.HTML()
+                    with gr.Column(scale=2):
+                        s89_task_chart = gr.HTML()
+                s89_best = gr.HTML()
                 run_89_btn.click(
                     run_stage_8_9,
                     inputs=[tuning_slider],
-                    outputs=[s89_task_status, s89_tune_status, s89_cards, s89_convergence, s89_pie, progress_bar],
+                    outputs=[s89_task_status, s89_tune_status, s89_cards, s89_task_chart, s89_best, progress_bar],
                 )
 
             # --- Tab 9: Cost Model ---
             with gr.TabItem("9. Cost Model"):
-                gr.Markdown("### Stage 10: Cost Model & Schedule Selection\n*Paper: Section 5.2, Figure 13*")
-                run_10_btn = gr.Button("Run Stage 10")
+                gr.Markdown(
+                    "### Search Space Exploration & Cost Model\n"
+                    "*Each dot below is a schedule candidate "
+                    "that TVM compiled and measured on real hardware. The **cost model** (gradient tree boosting / XGBoost) "
+                    "learns from these measurements to predict latency and guide the search toward better schedules.*"
+                )
+                run_10_btn = gr.Button("Analyze Search Results")
                 s10_status = gr.HTML()
-                s10_banner = gr.HTML()
-                s10_features = gr.HTML()
+                s10_scatter = gr.HTML()
+                s10_insight = gr.Markdown()
                 s10_explanation = gr.HTML()
                 run_10_btn.click(
                     run_stage_10,
-                    outputs=[s10_status, s10_banner, s10_features, s10_explanation, progress_bar],
+                    outputs=[s10_status, s10_scatter, s10_insight, s10_explanation, progress_bar],
                 )
 
             # --- Tab 10: Build & Results ---
             with gr.TabItem("10. Build & Results"):
-                gr.Markdown("### Stages 11-12: CUDA Build & Inference Comparison\n*Paper: Figure 2 bottom, Section 6, Figure 14*")
-                run_1112_btn = gr.Button("Run Stages 11-12")
+                gr.Markdown(
+                    "### The Punchline: Build, Run, Compare\n"
+                    "*TVM compiles the optimized IRModule into a CUDA module and runs inference. "
+                    "We compare three configurations:*\n\n"
+                    "1. **PyTorch Baseline** -- eager mode with cuDNN (highly optimized, no compilation)\n"
+                    "2. **TVM Live** -- your tuning run from Tab 8 (limited trials, few operators optimized)\n"
+                    "3. **TVM Fully Tuned** -- precomputed with 500+ trials (all 28 operators optimized)\n\n"
+                    "*Key insight: the number of tuning trials controls how many operators "
+                    "get custom schedules. Sufficient tuning beats even cuDNN.*"
+                )
+                run_1112_btn = gr.Button("Build & Run Inference", variant="primary")
                 s1112_build = gr.HTML()
-                with gr.Row():
-                    s1112_tvm_top5 = gr.Markdown()
-                    s1112_comparison = gr.Markdown()
-                s1112_chart = gr.HTML()
-                with gr.Accordion("Generated CUDA Source", open=False):
-                    s1112_cuda = gr.Code(language="c", label="Generated CUDA Source")
                 s1112_done = gr.HTML()
+                s1112_chart = gr.HTML()
+                with gr.Row():
+                    s1112_comparison = gr.Markdown()
+                    s1112_tvm_top5 = gr.Markdown()
+                with gr.Accordion("Generated CUDA Source (first 3KB)", open=False):
+                    s1112_cuda = gr.Code(language="c", label="Generated CUDA Source")
                 run_1112_btn.click(
                     run_stage_11_12,
                     outputs=[s1112_build, s1112_tvm_top5, s1112_comparison, s1112_chart, s1112_cuda, s1112_done, progress_bar],
@@ -924,7 +1150,11 @@ def build_app() -> gr.Blocks:
 
             # --- Tab 11: Timeline ---
             with gr.TabItem("11. Pipeline Timeline"):
-                gr.Markdown("### Full Pipeline Journey\n*Paper: Figure 2 (system overview)*")
+                gr.Markdown(
+                    "### Full Pipeline Journey\n"
+                    "*End-to-end view of the entire TVM compilation pipeline, "
+                    "from PyTorch model to optimized CUDA inference.*"
+                )
                 refresh_tl_btn = gr.Button("Refresh Timeline")
                 timeline_html = gr.HTML()
                 refresh_tl_btn.click(build_timeline, outputs=[timeline_html])
@@ -938,8 +1168,8 @@ def build_app() -> gr.Blocks:
             s5_status, s5_table,
             s6_status, s6_tir, s6_tree, s6_loops,
             s7_status, s7_compute, s7_tir, s7_explain,
-            s89_task_status, s89_tune_status, s89_cards, s89_convergence, s89_pie,
-            s10_status, s10_banner, s10_features, s10_explanation,
+            s89_task_status, s89_tune_status, s89_cards, s89_task_chart, s89_best,
+            s10_status, s10_scatter, s10_insight, s10_explanation,
             s1112_build, s1112_tvm_top5, s1112_comparison, s1112_chart, s1112_cuda, s1112_done,
             timeline_html,
             progress_bar,

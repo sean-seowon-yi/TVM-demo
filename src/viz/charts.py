@@ -254,8 +254,251 @@ def task_weight_pie_chart(
     return _fig_to_base64_img(fig)
 
 
+def three_bar_latency_chart(
+    pytorch_ms: float,
+    tvm_live_ms: float,
+    tvm_precomputed_ms: float,
+    live_trials: int = 8,
+    precomputed_trials: int = 512,
+    title: str = "Inference Latency: PyTorch vs TVM",
+    return_format: str = "html",
+) -> Any:
+    """Three-bar chart showing the tuning progression story.
+
+    Bar 1 (blue):  PyTorch baseline -- cuDNN, no compilation needed
+    Bar 2 (amber): TVM live demo   -- few trials, mostly default schedules
+    Bar 3 (green): TVM precomputed -- many trials, all operators optimized
+    """
+    _check_mpl()
+
+    labels = [
+        f"PyTorch\nBaseline",
+        f"TVM Live\n({live_trials} trials)",
+        f"TVM Tuned\n({precomputed_trials} trials)",
+    ]
+    values = [pytorch_ms, tvm_live_ms, tvm_precomputed_ms]
+    colors = ["#546E7A", "#FF8F00", "#2E7D32"]
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5), facecolor="#FAFAFA")
+    bars = ax.bar(labels, values, color=colors, width=0.52,
+                  edgecolor="white", linewidth=1.5, zorder=3)
+    ax.grid(axis="y", alpha=0.3, zorder=0)
+
+    ymax = max(values)
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + ymax * 0.02,
+            f"{val:.2f} ms",
+            ha="center", va="bottom", fontsize=11, fontweight="bold",
+        )
+
+    live_speedup = pytorch_ms / tvm_live_ms if tvm_live_ms > 0 else 0
+    pre_speedup = pytorch_ms / tvm_precomputed_ms if tvm_precomputed_ms > 0 else 0
+
+    if live_speedup < 1:
+        live_label = f"{live_speedup:.2f}x\n(slower)"
+        live_color = "#D84315"
+    else:
+        live_label = f"{live_speedup:.2f}x"
+        live_color = "#E65100"
+
+    pre_label = f"{pre_speedup:.2f}x faster"
+    pre_color = "#1B5E20"
+
+    ax.annotate(
+        live_label,
+        xy=(1, tvm_live_ms + ymax * 0.01),
+        xytext=(1.45, tvm_live_ms + ymax * 0.18),
+        fontsize=9, fontweight="bold", color=live_color, ha="center",
+        arrowprops=dict(arrowstyle="->", color=live_color, lw=1.2),
+    )
+    ax.annotate(
+        pre_label,
+        xy=(2, tvm_precomputed_ms + ymax * 0.01),
+        xytext=(1.55, tvm_precomputed_ms + ymax * 0.22),
+        fontsize=10, fontweight="bold", color=pre_color, ha="center",
+        arrowprops=dict(arrowstyle="->", color=pre_color, lw=1.5),
+    )
+
+    # Dashed line at PyTorch level for easy visual comparison
+    ax.axhline(y=pytorch_ms, color="#546E7A", linestyle=":", linewidth=1, alpha=0.5, zorder=2)
+
+    ax.set_title(title, fontsize=13, fontweight="bold", pad=14)
+    ax.set_ylabel("Latency (ms)", fontsize=10)
+    ax.set_ylim(0, ymax * 1.45)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+
+    if return_format == "pil":
+        return _fig_to_pil(fig)
+    elif return_format == "fig":
+        return fig
+    return _fig_to_base64_img(fig)
+
+
 def _short_name(name: str, max_len: int = 20) -> str:
     """Shorten a task name for chart labels."""
     if len(name) <= max_len:
         return name
     return name[:max_len - 3] + "..."
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-task tuning summary (horizontal bar chart)
+# ──────────────────────────────────────────────────────────────────────
+
+def per_task_summary_chart(
+    total_tasks: int,
+    tuned_task_names: List[str],
+    records: Optional[List[dict]] = None,
+    title: str = "Per-Task Tuning Summary",
+    return_format: str = "html",
+) -> Any:
+    """Horizontal bar chart showing tuned vs untuned tasks.
+
+    Parameters
+    ----------
+    total_tasks : total number of extracted tuning tasks (e.g. 28)
+    tuned_task_names : real task names from the MetaSchedule DB
+    records : tuning records (used to count candidates per task, optional)
+    """
+    _check_mpl()
+    import numpy as np
+
+    n_records = len(records) if records else 0
+
+    if not tuned_task_names and total_tasks == 0:
+        fig, ax = plt.subplots(figsize=(6, 2), facecolor="#FAFAFA")
+        ax.text(0.5, 0.5, "No tuning data", transform=ax.transAxes,
+                ha="center", va="center", fontsize=12, color="#999")
+        ax.set_axis_off()
+        return _fig_to_base64_img(fig)
+
+    n_tuned = len(tuned_task_names)
+
+    per_task_count: dict = {}
+    if records:
+        for r in records:
+            tn = r.get("task_name", "")
+            if tn and tn != "main" and not tn.startswith("task_"):
+                per_task_count[tn] = per_task_count.get(tn, 0) + 1
+
+    names = []
+    latencies = []
+    colors = []
+    annotations = []
+
+    for task_name in tuned_task_names:
+        short = _short_name(task_name, 25)
+        names.append(short)
+        latencies.append(1.0)
+        colors.append("#43A047")
+        count = per_task_count.get(task_name, 0)
+        if count > 0:
+            annotations.append(f"tuned ({count} candidates)")
+        else:
+            n_avg = max(1, n_records // n_tuned) if n_tuned > 0 else 0
+            annotations.append(f"tuned (~{n_avg} candidates)")
+
+    n_untuned = max(0, total_tasks - n_tuned)
+
+    if n_untuned > 0:
+        names.append(f"{n_untuned} untuned tasks")
+        latencies.append(1.0)
+        colors.append("#E0E0E0")
+        annotations.append("using DLight default schedules")
+
+    n = len(names)
+    fig_height = max(2.5, n * 0.38 + 1.2)
+    fig, ax = plt.subplots(figsize=(7, fig_height), facecolor="#FAFAFA")
+
+    y_pos = np.arange(n)
+    ax.barh(y_pos, latencies, color=colors, edgecolor="none", height=0.55)
+
+    for i, ann in enumerate(annotations):
+        txt_color = "#333" if colors[i] == "#43A047" else "#999"
+        style = "italic" if colors[i] == "#E0E0E0" else "normal"
+        ax.text(1.05, i, ann, va="center", fontsize=8, color=txt_color, style=style)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(names, fontsize=8, fontfamily="monospace")
+    ax.invert_yaxis()
+    ax.set_xlim(0, 2.5)
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=10)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+    ax.set_xticks([])
+    fig.tight_layout()
+
+    if return_format == "pil":
+        return _fig_to_pil(fig)
+    elif return_format == "fig":
+        return fig
+    return _fig_to_base64_img(fig)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Candidate latency scatter (search space exploration)
+# ──────────────────────────────────────────────────────────────────────
+
+def candidate_scatter_chart(
+    records: List[dict],
+    title: str = "Schedule Search Space Exploration",
+    return_format: str = "html",
+) -> Any:
+    """Scatter plot of all candidate latencies grouped by task.
+
+    Each dot is a measured schedule candidate. The x-axis is the trial
+    index, y-axis is the measured latency. Color encodes task identity.
+    This shows *how* the tuner explored different schedule configurations.
+    """
+    _check_mpl()
+    import numpy as np
+
+    if not records:
+        fig, ax = plt.subplots(figsize=(7, 3), facecolor="#FAFAFA")
+        ax.text(0.5, 0.5, "No candidates", transform=ax.transAxes,
+                ha="center", va="center", fontsize=12, color="#999")
+        ax.set_axis_off()
+        return _fig_to_base64_img(fig)
+
+    valid = [r for r in records if r.get("run_ms", float("inf")) < 1e6]
+    if not valid:
+        fig, ax = plt.subplots(figsize=(7, 3), facecolor="#FAFAFA")
+        ax.text(0.5, 0.5, "No valid measurements", transform=ax.transAxes,
+                ha="center", va="center", fontsize=12, color="#999")
+        ax.set_axis_off()
+        return _fig_to_base64_img(fig)
+
+    task_names = sorted(set(r["task_name"] for r in valid))
+    cmap = plt.cm.Set2(np.linspace(0, 1, max(len(task_names), 1)))
+    task_color = {name: cmap[i] for i, name in enumerate(task_names)}
+
+    fig, ax = plt.subplots(figsize=(7, 4), facecolor="#FAFAFA")
+
+    for name in task_names:
+        task_recs = [r for r in valid if r["task_name"] == name]
+        xs = [r["candidate_id"] for r in task_recs]
+        ys = [r["run_ms"] for r in task_recs]
+        ax.scatter(xs, ys, label=_short_name(name, 18), color=task_color[name],
+                   s=30, alpha=0.7, edgecolors="white", linewidths=0.5)
+
+    ax.set_xlabel("Trial Index", fontsize=9)
+    ax.set_ylabel("Measured Latency (ms)", fontsize=9)
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=10)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    if len(task_names) <= 8:
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
+
+    fig.tight_layout()
+
+    if return_format == "pil":
+        return _fig_to_pil(fig)
+    elif return_format == "fig":
+        return fig
+    return _fig_to_base64_img(fig)

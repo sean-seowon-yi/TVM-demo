@@ -707,19 +707,25 @@ def _extract_prim_params(func: Any) -> List[dict]:
 
 def _count_blocks(node: Any, _depth: int = 0) -> int:
     """Recursively count tvm.tir.Block nodes in a TIR AST."""
-    if _depth > 200:
+    if _depth > 200 or node is None:
         return 0
     count = 0
-    if type(node).__name__ == "Block":
+    if _is_tir_block(node):
         count += 1
-    for attr_name in ("body", "then_case", "else_case", "block"):
-        child = getattr(node, attr_name, None)
+    if _is_tir_seq_stmt(node):
+        try:
+            for s in node:
+                count += _count_blocks(s, _depth + 1)
+        except TypeError:
+            pass
+        return count
+    for attr_name in ("body", "then_case", "else_case", "block", "init"):
+        try:
+            child = getattr(node, attr_name, None)
+        except Exception:
+            continue
         if child is not None:
             count += _count_blocks(child, _depth + 1)
-    seq = getattr(node, "seq", None)
-    if seq is not None:
-        for s in seq:
-            count += _count_blocks(s, _depth + 1)
     return count
 
 
@@ -830,15 +836,54 @@ def _walk_tir_ast(node: Any, _depth: int = 0) -> dict:
     if _depth > 200:
         return result
     _walk_tir_ast_impl(node, result, _depth)
+
+    if not result["blocks"] and not result["loops"]:
+        _walk_tir_ast_via_tvm_visitor(node, result)
+
     return result
 
 
-def _walk_tir_ast_impl(node: Any, out: dict, depth: int) -> None:
-    if depth > 200:
-        return
-    node_type = type(node).__name__
+def _is_tir_for(node: Any) -> bool:
+    try:
+        if _TVM_AVAILABLE and isinstance(node, tvm.tir.For):
+            return True
+    except AttributeError:
+        pass
+    return type(node).__name__ == "For"
 
-    if node_type == "For":
+
+def _is_tir_block(node: Any) -> bool:
+    try:
+        if _TVM_AVAILABLE and isinstance(node, tvm.tir.Block):
+            return True
+    except AttributeError:
+        pass
+    return type(node).__name__ == "Block"
+
+
+def _is_tir_block_realize(node: Any) -> bool:
+    try:
+        if _TVM_AVAILABLE and isinstance(node, tvm.tir.BlockRealize):
+            return True
+    except AttributeError:
+        pass
+    return type(node).__name__ == "BlockRealize"
+
+
+def _is_tir_seq_stmt(node: Any) -> bool:
+    try:
+        if _TVM_AVAILABLE and isinstance(node, tvm.tir.SeqStmt):
+            return True
+    except AttributeError:
+        pass
+    return type(node).__name__ == "SeqStmt"
+
+
+def _walk_tir_ast_impl(node: Any, out: dict, depth: int) -> None:
+    if depth > 200 or node is None:
+        return
+
+    if _is_tir_for(node):
         loop_info: dict = {
             "var": str(getattr(node, "loop_var", "?")),
             "extent": _tir_value(getattr(node, "extent", None)),
@@ -851,10 +896,10 @@ def _walk_tir_ast_impl(node: Any, out: dict, depth: int) -> None:
         else:
             loop_info["thread_binding"] = ""
         out["loops"].append(loop_info)
-        _walk_tir_ast_impl(node.body, out, depth + 1)
+        _walk_tir_ast_impl(getattr(node, "body", None), out, depth + 1)
         return
 
-    if node_type == "Block":
+    if _is_tir_block(node):
         block_info: dict = {"name": str(getattr(node, "name_hint", ""))}
         iters = getattr(node, "iter_vars", [])
         block_info["iter_vars"] = [str(iv) for iv in iters]
@@ -888,26 +933,85 @@ def _walk_tir_ast_impl(node: Any, out: dict, depth: int) -> None:
                 "source": "block_iter",
             })
 
-        body = getattr(node, "body", None)
-        if body is not None:
-            _walk_tir_ast_impl(body, out, depth + 1)
+        init = getattr(node, "init", None)
+        if init is not None:
+            _walk_tir_ast_impl(init, out, depth + 1)
+        _walk_tir_ast_impl(getattr(node, "body", None), out, depth + 1)
         return
 
-    if node_type == "BlockRealize":
-        block = getattr(node, "block", None)
-        if block is not None:
-            _walk_tir_ast_impl(block, out, depth + 1)
+    if _is_tir_block_realize(node):
+        _walk_tir_ast_impl(getattr(node, "block", None), out, depth + 1)
         return
 
-    if node_type == "SeqStmt":
-        for s in node:
-            _walk_tir_ast_impl(s, out, depth + 1)
+    if _is_tir_seq_stmt(node):
+        try:
+            for s in node:
+                _walk_tir_ast_impl(s, out, depth + 1)
+        except TypeError:
+            seq = getattr(node, "seq", None)
+            if seq is not None:
+                for s in seq:
+                    _walk_tir_ast_impl(s, out, depth + 1)
         return
 
-    for attr in ("body", "then_case", "else_case"):
-        child = getattr(node, attr, None)
-        if child is not None:
+    for attr in ("body", "then_case", "else_case", "value"):
+        try:
+            child = getattr(node, attr, None)
+        except Exception:
+            continue
+        if child is not None and hasattr(child, "__class__"):
             _walk_tir_ast_impl(child, out, depth + 1)
+
+
+def _walk_tir_ast_via_tvm_visitor(root: Any, out: dict) -> None:
+    """Fallback: use TVM's built-in post_order_visit to find all For/Block."""
+    try:
+        from tvm.tir import stmt_functor
+        def _visit(stmt):
+            if _is_tir_for(stmt):
+                loop_info = {
+                    "var": str(getattr(stmt, "loop_var", "?")),
+                    "extent": _tir_value(getattr(stmt, "extent", None)),
+                    "kind": str(getattr(stmt, "kind", "")),
+                    "thread_binding": "",
+                    "source": "for_loop",
+                }
+                thread = getattr(stmt, "thread_binding", None)
+                if thread is not None:
+                    tag = getattr(thread, "thread_tag", None)
+                    loop_info["thread_binding"] = str(tag) if tag else ""
+                out["loops"].append(loop_info)
+            elif _is_tir_block(stmt):
+                block_info = {
+                    "name": str(getattr(stmt, "name_hint", "")),
+                    "iter_vars": [str(iv) for iv in getattr(stmt, "iter_vars", [])],
+                    "num_reads": len(getattr(stmt, "reads", [])),
+                    "num_writes": len(getattr(stmt, "writes", [])),
+                }
+                out["blocks"].append(block_info)
+                for iv in getattr(stmt, "iter_vars", []):
+                    dom = getattr(iv, "dom", None)
+                    extent_val = _tir_value(getattr(dom, "extent", None)) if dom else "?"
+                    iter_type_raw = getattr(iv, "iter_type", None)
+                    kind = ""
+                    if iter_type_raw is not None:
+                        it_str = str(iter_type_raw)
+                        if "Spatial" in it_str or it_str == "0":
+                            kind = "S"
+                        elif "Reduction" in it_str or it_str == "2":
+                            kind = "R"
+                        else:
+                            kind = it_str
+                    out["loops"].append({
+                        "var": str(getattr(iv, "var", iv)),
+                        "extent": extent_val,
+                        "kind": kind,
+                        "thread_binding": "",
+                        "source": "block_iter",
+                    })
+        stmt_functor.post_order_visit(root, _visit)
+    except Exception as exc:
+        log.debug("TVM post_order_visit fallback failed: %s", exc)
 
 
 def _tir_value(v: Any) -> str:
@@ -964,9 +1068,6 @@ def build_te_microscope(
     thousands of schedule transformations — tile sizes, loop reordering, thread
     bindings, cache reads/writes — to find an optimized version of this program
     for the target GPU.
-
-    This maps directly to paper Section 4.1 and Figure 5 (left column →
-    schedule transformation → optimized low-level code).
     """)
 
     log.info("TE microscope: conv2d %dx%dx%dx%d", n, co, h, w)
@@ -1264,6 +1365,88 @@ def run_tuning(
     return records, convergence, work_dir
 
 
+def count_tuned_tasks_from_db(
+    work_dir: str,
+) -> Tuple[int, List[str]]:
+    """Count distinct tasks with tuning records by reading the MetaSchedule DB.
+
+    Uses the same workload name map that _fixup_main_task_names uses, so
+    the task labels here are guaranteed to match the per-record task_name
+    values shown in Stage 9.
+
+    Returns (num_distinct_tasks, list_of_task_labels).
+    """
+    wl_map = _build_workload_name_map(work_dir)
+    if not wl_map:
+        return 0, []
+    names = list(wl_map.values())
+    return len(names), names
+
+
+def _disambiguate_names(names: List[str]) -> List[str]:
+    """Append numeric suffixes to duplicate names so each entry is unique."""
+    counts: dict = {}
+    for n in names:
+        counts[n] = counts.get(n, 0) + 1
+
+    has_dups = {n for n, c in counts.items() if c > 1}
+    if not has_dups:
+        return names
+
+    seen: dict = {}
+    result: List[str] = []
+    for n in names:
+        if n in has_dups:
+            idx = seen.get(n, 0)
+            seen[n] = idx + 1
+            result.append(f"{n}_{idx}")
+        else:
+            result.append(n)
+    return result
+
+
+def _extract_block_name_from_trace(trace_data: Any) -> Optional[str]:
+    """Extract the primary block name from a MetaSchedule trace entry.
+
+    Only examines GetSBlock / GetBlock instructions to avoid picking up
+    non-block-name attrs like threadIdx.x, meta_schedule.*, etc.
+    """
+    _BLOCK_OPS = ("GetSBlock", "GetBlock", "GetSBlock!")
+    _SKIP = {"main", "root", ""}
+    try:
+        if not isinstance(trace_data, list) or len(trace_data) < 1:
+            return None
+        trace_and_decisions = trace_data[0]
+        if not isinstance(trace_and_decisions, list) or len(trace_and_decisions) < 1:
+            return None
+        instructions = trace_and_decisions[0]
+        if not isinstance(instructions, list):
+            return None
+
+        block_names: List[str] = []
+        for inst in instructions:
+            if not isinstance(inst, list) or len(inst) < 3:
+                continue
+            inst_kind = inst[0] if isinstance(inst[0], str) else ""
+            if inst_kind not in _BLOCK_OPS:
+                continue
+            attrs = inst[2]
+            if isinstance(attrs, list):
+                for attr in attrs:
+                    if isinstance(attr, str) and attr not in _SKIP:
+                        name = attr
+                        if name.startswith("T_"):
+                            name = name[2:]
+                        if name not in block_names:
+                            block_names.append(name)
+
+        if block_names:
+            return _pick_primary_block_name(block_names)
+    except Exception:
+        pass
+    return None
+
+
 def _try_tune(
     ms: Any,
     mod: Any,
@@ -1402,10 +1585,20 @@ def _collect_records_from_db(
     task_name_override: str = "",
     trial_offset: int = 0,
 ) -> Tuple[List[dict], List[dict]]:
-    """Read tuning records from a MetaSchedule database object or work_dir."""
-    records: List[dict] = []
-    convergence: List[dict] = []
+    """Read tuning records from a MetaSchedule database object or work_dir.
 
+    Prefers reading directly from the JSON file when available, since that
+    embeds the workload index alongside each record — giving us reliable
+    task-name assignment without depending on API record ordering.
+    """
+    records, convergence = _collect_records_from_json(
+        work_dir, task_name_override, trial_offset,
+    )
+    if records:
+        return records, convergence
+
+    records = []
+    convergence = []
     raw_records = _read_raw_records(db, work_dir)
 
     best_so_far = float("inf")
@@ -1434,7 +1627,329 @@ def _collect_records_from_db(
         best_idx = min(range(len(records)), key=lambda j: records[j]["run_ms"])
         records[best_idx]["is_best"] = True
 
+    _fixup_main_task_names(records, work_dir)
+
     return records, convergence
+
+
+def _collect_records_from_json(
+    work_dir: str,
+    task_name_override: str = "",
+    trial_offset: int = 0,
+) -> Tuple[List[dict], List[dict]]:
+    """Read tuning records directly from database_tuning_record.json.
+
+    Each JSON line contains [wl_idx, [trace_data, run_secs, ...]],
+    so workload index and trace are guaranteed to be aligned.
+    """
+    import json as _json
+    db_path = os.path.join(work_dir, "database_tuning_record.json")
+    if not os.path.exists(db_path):
+        return [], []
+
+    wl_name_map = _build_workload_name_map(work_dir)
+
+    records: List[dict] = []
+    convergence: List[dict] = []
+    best_so_far = float("inf")
+
+    try:
+        with open(db_path, "r") as fh:
+            for i, line in enumerate(fh):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, list) or len(entry) < 2:
+                    continue
+
+                wl_idx = entry[0]
+                data = entry[1]
+
+                run_secs = _json_entry_run_secs(data)
+                trace_text = _json_entry_to_trace_text(data)
+                task_name = task_name_override or wl_name_map.get(wl_idx, f"task_{wl_idx}")
+
+                run_ms = run_secs * 1000.0 if run_secs < 1e6 else float("inf")
+                best_so_far = min(best_so_far, run_ms)
+
+                records.append({
+                    "candidate_id": trial_offset + i,
+                    "task_name": task_name,
+                    "trace_text": trace_text,
+                    "run_secs": run_secs,
+                    "run_ms": run_ms,
+                    "is_best": False,
+                })
+                convergence.append({
+                    "trial_index": trial_offset + i,
+                    "best_latency_ms": best_so_far,
+                })
+    except Exception:
+        return [], []
+
+    if records:
+        best_idx = min(range(len(records)), key=lambda j: records[j]["run_ms"])
+        records[best_idx]["is_best"] = True
+
+    return records, convergence
+
+
+def _json_entry_run_secs(data: Any) -> float:
+    """Extract run_secs from a JSON record's data payload."""
+    try:
+        if isinstance(data, list) and len(data) > 1:
+            run_list = data[1]
+            if isinstance(run_list, list) and run_list:
+                return float(run_list[0])
+    except (TypeError, ValueError, IndexError):
+        pass
+    return float("inf")
+
+
+_INST_NAME_MAP = {
+    "GetSBlock": "get_sblock", "GetBlock": "get_block",
+    "GetLoops": "get_loops", "GetChildBlocks": "get_child_blocks",
+    "GetConsumers": "get_consumers", "GetProducers": "get_producers",
+    "Split": "split", "Fuse": "fuse", "Reorder": "reorder",
+    "Bind": "bind", "Vectorize": "vectorize", "Unroll": "unroll",
+    "Parallel": "parallel", "ComputeAt": "compute_at",
+    "ReverseComputeAt": "reverse_compute_at",
+    "ComputeInline": "compute_inline",
+    "ReverseComputeInline": "reverse_compute_inline",
+    "CacheRead": "cache_read", "CacheWrite": "cache_write",
+    "SetScope": "set_scope", "StorageAlign": "storage_align",
+    "SamplePerfectTile": "sample_perfect_tile",
+    "SampleCategorical": "sample_categorical",
+    "Annotate": "annotate", "Unannotate": "unannotate",
+    "DecomposeReduction": "decompose_reduction",
+    "EnterPostproc": "enter_postproc",
+}
+
+
+def _json_entry_to_trace_text(data: Any) -> str:
+    """Convert JSON trace data to a readable sch.xxx(...) trace string.
+
+    JSON structure: data = [[instructions_list, decisions_list], [run_secs], ...]
+    Decisions are resolved so split factors show actual values (e.g., 64)
+    instead of variable names (e.g., v4).
+    """
+    try:
+        if not isinstance(data, list) or not data:
+            return ""
+        trace_pair = data[0]
+        if not isinstance(trace_pair, list) or not trace_pair:
+            return str(data)[:500]
+        instructions = trace_pair[0]
+        decisions = trace_pair[1] if len(trace_pair) > 1 and isinstance(trace_pair[1], list) else []
+        if isinstance(instructions, list) and instructions and isinstance(instructions[0], list):
+            return _instructions_to_trace(instructions, decisions)
+    except Exception:
+        pass
+    return str(data)[:500]
+
+
+def _resolve_decisions(instructions: list, decisions: list) -> dict:
+    """Build a map from variable names to their resolved values.
+
+    Decisions format: list of [inst_index, decision_value] where
+    - SampleCategorical: decision_value is an index into candidates
+    - SamplePerfectTile: decision_value is a list of tile factors
+    """
+    var_values: dict = {}
+    decision_map = {}
+    for d in decisions:
+        if isinstance(d, list) and len(d) >= 2:
+            decision_map[d[0]] = d[1]
+
+    for i, inst in enumerate(instructions):
+        if not isinstance(inst, list) or len(inst) < 4:
+            continue
+        kind = inst[0]
+        attrs = inst[2] if isinstance(inst[2], list) else []
+        outputs = inst[3] if isinstance(inst[3], list) else []
+        decision = decision_map.get(i)
+
+        if kind == "SampleCategorical" and decision is not None:
+            candidates = attrs[0] if attrs and isinstance(attrs[0], list) else []
+            if isinstance(decision, int) and 0 <= decision < len(candidates):
+                chosen = candidates[decision]
+            else:
+                chosen = decision
+            if outputs:
+                var_values[outputs[0]] = chosen
+        elif kind == "SamplePerfectTile" and decision is not None:
+            if isinstance(decision, list) and len(decision) == len(outputs):
+                for var_name, val in zip(outputs, decision):
+                    var_values[var_name] = val
+
+    return var_values
+
+
+def _resolve_var(name: Any, var_values: dict) -> str:
+    """Resolve a variable name to its value, or return the name as-is."""
+    if isinstance(name, str) and name in var_values:
+        return str(var_values[name])
+    return str(name)
+
+
+def _instructions_to_trace(instructions: list, decisions: list = None) -> str:
+    """Convert a list of JSON instruction arrays to readable trace text."""
+    var_values = _resolve_decisions(instructions, decisions or [])
+
+    lines: List[str] = []
+    for inst in instructions:
+        if not isinstance(inst, list) or len(inst) < 4:
+            continue
+        kind = inst[0]
+        inputs = inst[1] if isinstance(inst[1], list) else []
+        attrs = inst[2] if isinstance(inst[2], list) else []
+        outputs = inst[3] if isinstance(inst[3], list) else []
+
+        method = _INST_NAME_MAP.get(kind, kind.lower() if isinstance(kind, str) else str(kind))
+
+        args_parts: List[str] = []
+        if kind in ("GetSBlock", "GetBlock"):
+            if len(attrs) >= 2:
+                args_parts.append(f'name="{attrs[0]}", func_name="{attrs[1]}"')
+            elif attrs:
+                args_parts.append(f'name="{attrs[0]}"')
+        elif kind == "Split":
+            if inputs:
+                resolved = [_resolve_var(f, var_values) for f in inputs[1:]]
+                args_parts.append(f"loop={inputs[0]}, factors=[{', '.join(resolved)}]")
+        elif kind == "Fuse":
+            args_parts.append(", ".join(str(x) for x in inputs))
+        elif kind == "Bind":
+            if inputs and attrs:
+                args_parts.append(f'loop={inputs[0]}, thread_axis="{attrs[0]}"')
+        elif kind == "SampleCategorical":
+            if outputs and outputs[0] in var_values:
+                chosen = var_values[outputs[0]]
+                candidates = attrs[0] if attrs and isinstance(attrs[0], list) else []
+                args_parts.append(f"candidates={candidates}, decision={chosen}")
+            elif len(attrs) >= 2:
+                args_parts.append(f"candidates={attrs[0]}, probs={attrs[1]}")
+        elif kind == "SamplePerfectTile":
+            resolved_out = [_resolve_var(o, var_values) for o in outputs]
+            args_parts.append(f"n={len(outputs)}, decision=[{', '.join(resolved_out)}]")
+        elif kind == "Annotate":
+            if inputs and len(attrs) >= 2:
+                val = _resolve_var(attrs[1], var_values) if isinstance(attrs[1], str) else attrs[1]
+                args_parts.append(
+                    f'block_or_loop={inputs[0]}, ann_key="{attrs[0]}", ann_val={val}'
+                )
+        else:
+            if inputs:
+                args_parts.append(", ".join(str(x) for x in inputs))
+
+        args_str = ", ".join(args_parts)
+        out_str = ", ".join(str(o) for o in outputs)
+
+        if out_str:
+            lines.append(f"{out_str} = sch.{method}({args_str})")
+        else:
+            lines.append(f"sch.{method}({args_str})")
+
+    return "\n".join(lines)
+
+
+def _extract_block_names_from_trace_text(trace_text: str) -> List[str]:
+    """Extract block names from a schedule trace string (sch.get_sblock calls)."""
+    import re
+    _SKIP = {"main", "root", ""}
+    names: List[str] = []
+    for m in re.finditer(r'get_sblock\(name="([^"]+)"', trace_text):
+        raw = m.group(1)
+        if raw in _SKIP:
+            continue
+        name = raw[2:] if raw.startswith("T_") else raw
+        if name not in names:
+            names.append(name)
+    if not names:
+        for m in re.finditer(r'GetSBlock["\s,\]]*\[.*?"([^"]+)"', trace_text):
+            raw = m.group(1)
+            if raw in _SKIP:
+                continue
+            name = raw[2:] if raw.startswith("T_") else raw
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _fixup_main_task_names(records: List[dict], work_dir: str) -> None:
+    """Replace generic task_names with real block names extracted from trace_text.
+
+    Uses each record's own trace to determine the correct block name,
+    then disambiguates duplicates with numeric suffixes.  This is
+    order-independent and does not rely on positional matching with the
+    JSON file.
+    """
+    if not records or not work_dir:
+        return
+
+    raw_group_names: List[str] = []
+    for rec in records:
+        blocks = _extract_block_names_from_trace_text(rec.get("trace_text", ""))
+        if blocks:
+            raw_group_names.append(_pick_primary_block_name(blocks))
+        else:
+            raw_group_names.append(rec.get("task_name", "unknown"))
+
+    unique_raw = list(dict.fromkeys(raw_group_names))
+    disambiguated = _disambiguate_names(unique_raw)
+    raw_to_final = dict(zip(unique_raw, disambiguated))
+
+    seen_raw_order: dict = {}
+    for i, raw_name in enumerate(raw_group_names):
+        final = raw_to_final.get(raw_name, raw_name)
+        records[i]["task_name"] = final
+
+
+def _build_workload_name_map(work_dir: str) -> dict:
+    """Build workload_index → task_name from the DB tuning records.
+
+    Groups records by workload index and extracts the primary block name
+    from each workload's trace.  Duplicate block names are disambiguated
+    with numeric suffixes so each workload gets a unique label.
+    """
+    import json as _json
+
+    db_path = os.path.join(work_dir, "database_tuning_record.json")
+    if not os.path.exists(db_path):
+        return {}
+
+    ordered_indices: List[Any] = []
+    raw_names_by_idx: dict = {}
+    try:
+        with open(db_path, "r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, list) or len(entry) < 2:
+                    continue
+                wl_idx = entry[0]
+                if wl_idx in raw_names_by_idx:
+                    continue
+                ordered_indices.append(wl_idx)
+                block_name = _extract_block_name_from_trace(entry[1])
+                fallback = f"workload_{str(wl_idx)[:8]}" if isinstance(wl_idx, str) else f"task_{wl_idx}"
+                raw_names_by_idx[wl_idx] = block_name or fallback
+    except Exception:
+        return {}
+
+    raw_names = [raw_names_by_idx[i] for i in ordered_indices]
+    unique_names = _disambiguate_names(raw_names)
+
+    return {idx: name for idx, name in zip(ordered_indices, unique_names)}
 
 
 def _read_raw_records(db: Any, work_dir: str) -> list:
@@ -1453,20 +1968,23 @@ def _read_raw_records(db: Any, work_dir: str) -> list:
         except Exception:
             pass
 
-    # Try reading from JSON files in work_dir
+    # Fallback: read only database_tuning_record.json (not workload file)
     import json
-    import glob as _glob
-    result = []
-    for f in sorted(_glob.glob(f"{work_dir}/**/*.json", recursive=True)):
+    db_path = os.path.join(work_dir, "database_tuning_record.json")
+    if os.path.exists(db_path):
+        result = []
         try:
-            with open(f, "r") as fh:
+            with open(db_path, "r") as fh:
                 for line in fh:
                     line = line.strip()
                     if line:
                         result.append(json.loads(line))
         except Exception:
-            continue
-    return result
+            pass
+        if result:
+            return result
+
+    return []
 
 
 def _extract_run_secs(rec: Any) -> float:
@@ -1522,22 +2040,93 @@ def _extract_trace(rec: Any) -> str:
 def _extract_task_name(rec: Any, fallback_idx: int) -> str:
     """Get the task name from a tuning record."""
     if isinstance(rec, dict):
-        return str(rec.get("task_name", rec.get("workload_key", f"task_{fallback_idx}")))
+        name = str(rec.get("task_name", rec.get("workload_key", f"task_{fallback_idx}")))
+        if name != "main":
+            return name
+
     for attr in ("task_name", "workload_key"):
         name = getattr(rec, attr, None)
-        if name:
+        if name and str(name) != "main":
             return str(name)
-    # Try to get name from workload's IRModule
+
     wl = getattr(rec, "workload", None)
     if wl is not None:
         wl_mod = getattr(wl, "mod", None)
         if wl_mod is not None:
-            try:
-                for gv in wl_mod.functions:
-                    return gv.name_hint
-            except Exception:
-                pass
+            block_name = _extract_primary_block_name_from_mod(wl_mod)
+            if block_name:
+                return block_name
     return f"task_{fallback_idx}"
+
+
+_COMPUTE_BLOCK_PRIORITY = [
+    "conv", "matmul", "dense", "batch_matmul", "gemm",
+    "pool", "softmax", "norm", "mean", "layer_norm",
+    "add", "multiply", "relu", "sigmoid", "tanh", "gelu",
+    "max_pool", "avg_pool",
+]
+
+
+def _pick_primary_block_name(names: List[str]) -> str:
+    """Pick the most descriptive block name from a list.
+
+    Also detects common fusion patterns (e.g. batch_norm = reshape +
+    subtract + divide + multiply) and returns a more descriptive name.
+    """
+    lower_set = {n.lower() for n in names}
+
+    if len(names) >= 5:
+        bn_signals = {"subtract", "divide", "multiply", "add"}
+        if bn_signals.issubset(lower_set) or (
+            len(bn_signals & lower_set) >= 3 and "compute" in lower_set
+        ):
+            return "batch_norm_fused"
+
+    for kw in _COMPUTE_BLOCK_PRIORITY:
+        for name in names:
+            if kw in name.lower():
+                return name
+    return names[0]
+
+
+def _extract_primary_block_name_from_mod(mod: Any) -> Optional[str]:
+    """Walk the PrimFunc body in a workload module to find the primary Block name."""
+    try:
+        for gv, func in _safe_mod_functions(mod):
+            if not isinstance(func, tvm.tir.PrimFunc):
+                continue
+            blocks = _collect_all_block_names(func.body)
+            useful = [b for b in blocks if b not in ("root", "", "main")]
+            if useful:
+                return _pick_primary_block_name(useful)
+    except Exception:
+        pass
+    return None
+
+
+def _collect_all_block_names(node: Any, depth: int = 0) -> List[str]:
+    """Collect all Block name_hints from a TIR statement tree."""
+    if depth > 100 or node is None:
+        return []
+    names: List[str] = []
+    if _is_tir_block(node):
+        n = str(getattr(node, "name_hint", ""))
+        if n:
+            names.append(n)
+    for attr in ("body", "block", "then_case", "else_case", "init"):
+        try:
+            child = getattr(node, attr, None)
+        except Exception:
+            continue
+        if child is not None:
+            names.extend(_collect_all_block_names(child, depth + 1))
+    if _is_tir_seq_stmt(node):
+        try:
+            for s in node:
+                names.extend(_collect_all_block_names(s, depth + 1))
+        except TypeError:
+            pass
+    return names
 
 
 def _synthetic_tuning_records(
@@ -1725,11 +2314,10 @@ def compute_tir_structural_features(mod: Any, op_name: str) -> dict:
 
 def _walk_tir_for_features(node: Any, features: dict, _depth: int = 0) -> None:
     """Recursively walk TIR to compute structural features."""
-    if _depth > 200:
+    if _depth > 200 or node is None:
         return
-    node_type = type(node).__name__
 
-    if node_type == "For":
+    if _is_tir_for(node):
         features["num_loops"] += 1
         extent = getattr(node, "extent", None)
         if extent is not None and hasattr(extent, "value"):
@@ -1737,40 +2325,42 @@ def _walk_tir_for_features(node: Any, features: dict, _depth: int = 0) -> None:
         thread = getattr(node, "thread_binding", None)
         if thread is not None:
             features["num_thread_bindings"] += 1
-            tag = str(getattr(thread, "thread_tag", ""))
-            if "threadIdx" in tag:
-                pass  # already counted
         kind = str(getattr(node, "kind", ""))
         if "Vectorized" in kind:
             features["num_vectorized_loops"] += 1
         if "Unrolled" in kind:
             features["num_unrolled_loops"] += 1
-        _walk_tir_for_features(node.body, features, _depth + 1)
+        _walk_tir_for_features(getattr(node, "body", None), features, _depth + 1)
         return
 
-    if node_type == "Block":
+    if _is_tir_block(node):
         features["num_blocks"] += 1
-        body = getattr(node, "body", None)
-        if body is not None:
-            _walk_tir_for_features(body, features, _depth + 1)
+        init = getattr(node, "init", None)
+        if init is not None:
+            _walk_tir_for_features(init, features, _depth + 1)
+        _walk_tir_for_features(getattr(node, "body", None), features, _depth + 1)
         return
 
-    if node_type == "BufferStore":
+    if type(node).__name__ == "BufferStore":
         features["num_buffer_stores"] += 1
 
-    if node_type == "BlockRealize":
-        block = getattr(node, "block", None)
-        if block is not None:
-            _walk_tir_for_features(block, features, _depth + 1)
+    if _is_tir_block_realize(node):
+        _walk_tir_for_features(getattr(node, "block", None), features, _depth + 1)
         return
 
-    if node_type == "SeqStmt":
-        for s in node:
-            _walk_tir_for_features(s, features, _depth + 1)
+    if _is_tir_seq_stmt(node):
+        try:
+            for s in node:
+                _walk_tir_for_features(s, features, _depth + 1)
+        except TypeError:
+            pass
         return
 
     for attr in ("body", "then_case", "else_case", "value"):
-        child = getattr(node, attr, None)
+        try:
+            child = getattr(node, attr, None)
+        except Exception:
+            continue
         if child is not None:
             _walk_tir_for_features(child, features, _depth + 1)
 
@@ -1783,8 +2373,13 @@ def build_tvm_module(
     mod: Any,
     params_np: Optional[List[np.ndarray]] = None,
     target_str: str = "cuda",
+    work_dir: Optional[str] = None,
 ) -> Tuple[Any, str, str, bool]:
     """Compile the (optionally tuned) IRModule into a runnable artifact.
+
+    If *work_dir* points to a MetaSchedule tuning log directory, the best
+    schedules from tuning are applied via ``compile_relax`` (the correct
+    TVM flow).  Otherwise falls back to DLight default GPU scheduling.
 
     If *params_np* is provided the parameters are bound as constants before
     building so the VM only needs the user input at call time.
@@ -1793,21 +2388,27 @@ def build_tvm_module(
     -------
     lib : tvm runtime module
     target_used : str
-    cuda_source : str   – generated CUDA source (best-effort, may be empty)
-    params_bound : bool – True if params were successfully bound as constants
+    cuda_source : str   -- generated CUDA source (best-effort, may be empty)
+    params_bound : bool -- True if params were successfully bound as constants
     """
     _require_tvm()
 
     target = _resolve_target(target_str)
     log.info("Building TVM module for target: %s", target)
 
+    # -- Path 1: use compile_relax with the tuning database (preferred) ------
+    if work_dir is not None and _ms_mod is not None:
+        lib, ok = _try_compile_with_db(mod, params_np, target, work_dir)
+        if ok:
+            cuda_src = _try_get_cuda_source(lib)
+            return lib, str(target), cuda_src, True
+
+    # -- Path 2: DLight defaults (fallback) ----------------------------------
     build_mod = mod
     params_bound = False
     if params_np is not None:
         build_mod, params_bound = _bind_params(mod, params_np)
 
-    # Apply DLight default GPU scheduling (tiles loops + binds to GPU threads).
-    # Without this, naive TIR will fail CUDA memory verification.
     if _dlight_available and "cuda" in str(target).lower():
         build_mod = _apply_dlight(build_mod, target)
 
@@ -1815,6 +2416,43 @@ def build_tvm_module(
 
     cuda_src = _try_get_cuda_source(lib)
     return lib, str(target), cuda_src, params_bound
+
+
+def _try_compile_with_db(
+    mod: Any,
+    params_np: Optional[List[np.ndarray]],
+    target: Any,
+    work_dir: str,
+) -> Tuple[Any, bool]:
+    """Apply MetaSchedule tuning records, then DLight for untuned tasks, then build."""
+    try:
+        import os
+        db_path = os.path.join(work_dir, "database_tuning_record.json")
+        if not os.path.exists(db_path):
+            log.info("No tuning DB found at %s, skipping", db_path)
+            return None, False
+
+        apply_db = tvm.relax.transform.MetaScheduleApplyDatabase
+        with target:
+            tuned_mod = apply_db(work_dir=work_dir, enable_warning=True)(mod)
+        log.info("MetaScheduleApplyDatabase applied from %s", work_dir)
+
+        # Bind params
+        build_mod = tuned_mod
+        params_bound = False
+        if params_np is not None:
+            build_mod, params_bound = _bind_params(tuned_mod, params_np)
+
+        # DLight fills in default GPU schedules for any tasks not in the DB
+        if _dlight_available and "cuda" in str(target).lower():
+            build_mod = _apply_dlight(build_mod, target)
+
+        lib = tvm_relax.build(build_mod, target=target)
+        log.info("Build with tuning DB succeeded — tuning schedules applied")
+        return lib, True
+    except Exception as exc:
+        log.warning("compile with tuning DB failed (%s), falling back to DLight only", exc)
+        return None, False
 
 
 def _apply_dlight(mod: Any, target: Any) -> Any:

@@ -155,13 +155,17 @@ def operator_table_html(operators: List[dict]) -> str:
         'border-radius:6px;font-size:12px">'
         f'<b>{len(operators)} operators</b> &mdash; '
         + " &nbsp; ".join(summary_parts)
-        + '</div>'
+        + '<br><span style="font-size:11px;color:#555">'
+        + 'Blocks = count of explicit TIR <code>Block</code> nodes; many '
+        + 'lowered GPU kernels rely mostly on loops, so it is normal to see '
+        + '<code>0</code> here. Use the Stage 6 “TensorIR / AST” tab to inspect '
+        + 'full loop structure.</span></div>'
     )
 
     header = (
         "<tr>"
         "<th>#</th><th>Name</th><th>Kind</th>"
-        "<th>Params</th><th>Blocks</th><th>IR Lines</th>"
+        "<th>Params</th><th>Blocks*</th><th>IR Lines</th>"
         "</tr>"
     )
     rows = []

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -297,16 +298,21 @@ def test_extract_tuning_tasks(state: DemoState) -> None:
 
 def test_run_tuning(state: DemoState) -> None:
     _separator("Stage 9 -- Schedule exploration (tuning)")
+    import shutil
+    test_work_dir = "./test_tuning_logs"
+    if os.path.exists(test_work_dir):
+        shutil.rmtree(test_work_dir)
     records, convergence, work_dir = run_tuning(
         state.current_mod,
         target=getattr(state, "_tuning_target", None),
-        work_dir="./tuning_logs",
+        work_dir=test_work_dir,
         max_trials_global=16,
         num_trials_per_iter=8,
         max_tasks=2,
     )
     state.tuning_records = records
     state.convergence_data = convergence
+    state.tuning_work_dir = work_dir
 
     is_synthetic = any(r.get("_synthetic") for r in records)
     label = " (synthetic)" if is_synthetic else ""
@@ -387,6 +393,7 @@ def test_build(state: DemoState) -> None:
         state.current_mod,
         params_np=state.model_params_np,
         target_str="cuda",
+        work_dir=state.tuning_work_dir,
     )
     state.compiled_lib = lib
     state.target_str = target_used
