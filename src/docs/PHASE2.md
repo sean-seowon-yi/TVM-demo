@@ -1,5 +1,7 @@
 # Phase 2 -- Graph & Operator Visualization
 
+> **Status note (2026-03-11):** Historical phase log. Some specifics may differ from current behavior after later fixes/refactors; use README.md + code as source of truth.
+
 > **Goal**: Add pipeline stages 2, 5, 6, and 7, plus two visualization modules
 > (`graph_render` and `ir_display`), so every intermediate compiler artifact
 > produced by Phase 1 can be inspected visually.  This phase is the "lens"

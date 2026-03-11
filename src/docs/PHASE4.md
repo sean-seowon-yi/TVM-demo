@@ -1,5 +1,7 @@
 # Phase 4 -- Gradio App
 
+> **Status note (2026-03-11):** Historical phase log. Some specifics may differ from current behavior after later fixes/refactors; use README.md + code as source of truth.
+
 > **Goal**: Wire every backend pipeline function and visualization utility into
 > an interactive Gradio web UI with 11 tabs, top-level controls, progress
 > tracking, and per-stage error handling.  This is the final integration pass

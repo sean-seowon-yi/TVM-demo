@@ -1,5 +1,7 @@
 # TVM Demo — Full Implementation Plan
 
+> **Status note (2026-03-11):** This file is the original implementation plan and contains historical design intents. For current, verified behavior, treat `app.py`, `src/backend/pipeline.py`, `src/viz/*`, and `README.md` as source of truth.
+
 > **Paper**: *TVM: An Automated End-to-End Optimizing Compiler for Deep Learning*
 > (Chen et al., OSDI '18)
 >

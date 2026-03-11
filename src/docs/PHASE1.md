@@ -1,5 +1,7 @@
 # Phase 1 -- Core Pipeline (Headless)
 
+> **Status note (2026-03-11):** Historical phase log. Some specifics may differ from current behavior after later fixes/refactors; use README.md + code as source of truth.
+
 > **Goal**: Build the foundational backend that runs the full TVM compilation
 > pipeline end-to-end without any UI -- from loading a PyTorch model through
 > TVM import, graph-level passes, CUDA module build, and inference comparison.

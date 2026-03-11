@@ -47,6 +47,7 @@ from backend.pipeline import (
     build_tvm_module,
     run_tvm_inference,
     compare_results,
+    count_tuned_tasks_from_db,
 )
 
 logging.basicConfig(
@@ -324,7 +325,7 @@ def test_run_tuning(state: DemoState) -> None:
 
     # Viz test: candidate cards
     from viz.schedule_display import candidate_cards_html, trace_to_readable
-    cards_html = candidate_cards_html(records, max_display=5)
+    cards_html = candidate_cards_html(records)
     print(f"  Candidate cards HTML: {len(cards_html)} chars")
 
     if records:
@@ -365,11 +366,6 @@ def test_select_best(state: DemoState) -> None:
     explanation_html = cost_model_explanation_html()
     print(f"  Feature table HTML: {len(table_html)} chars")
     print(f"  Cost model explanation HTML: {len(explanation_html)} chars")
-
-    # Viz test: best candidate banner
-    from viz.schedule_display import best_candidate_banner_html
-    banner = best_candidate_banner_html(best)
-    print(f"  Best candidate banner HTML: {len(banner)} chars")
 
     # TIR structural features for one operator (if available)
     if state.operators:
@@ -543,6 +539,110 @@ def assert_correctness(state: DemoState) -> None:
     print("\n  All assertions passed.\n")
 
 
+def test_end_to_end_consistency(state: DemoState) -> None:
+    """Cross-stage consistency checks for outputs and display summaries.
+
+    Purpose:
+      Validate that stage artifacts agree with each other (tasks, records,
+      best-candidate selection, DB coverage, and visualization summaries),
+      not just that each stage runs.
+    """
+    _separator("End-to-end consistency checks")
+
+    # Core artifact presence across stages 0-12
+    required_done = [f"stage_{i}" for i in range(13)]
+    for sid in required_done:
+        assert state.stage_status.get(sid) == StageStatus.DONE, f"{sid} not done"
+    print("  [PASS] Stage status 0-12 all done")
+
+    # Stage 8/9 accounting
+    records = state.tuning_records
+    conv = state.convergence_data
+    assert records, "No tuning records"
+    assert conv, "No convergence data"
+    assert len(records) == len(conv), (
+        f"records ({len(records)}) != convergence points ({len(conv)})"
+    )
+    print(f"  [PASS] Records/convergence counts match: {len(records)}")
+
+    # Candidate ids should be unique and monotonic in this smoke run
+    cand_ids = [r["candidate_id"] for r in records]
+    assert len(cand_ids) == len(set(cand_ids)), "Duplicate candidate_id found"
+    assert cand_ids == sorted(cand_ids), "candidate_id not monotonic"
+    print("  [PASS] Candidate IDs are unique and monotonic")
+
+    # Best candidate should be uniquely marked and match min run_ms
+    valid = [r for r in records if r.get("run_ms", float("inf")) < 1e6]
+    assert valid, "No valid measured candidates"
+    best_marked = [r for r in records if r.get("is_best")]
+    assert len(best_marked) == 1, f"Expected 1 best candidate, got {len(best_marked)}"
+    best_true = min(valid, key=lambda r: r["run_ms"])
+    assert best_marked[0]["candidate_id"] == best_true["candidate_id"], (
+        "is_best marker does not match true minimum latency candidate"
+    )
+    print(f"  [PASS] Best candidate marker consistent: #{best_true['candidate_id']}")
+
+    # Per-task coverage consistency (records vs tuning DB)
+    record_tasks = [
+        r["task_name"]
+        for r in records
+        if r.get("task_name")
+        and r["task_name"] != "main"
+        and not r["task_name"].startswith("task_")
+    ]
+    unique_record_tasks = list(dict.fromkeys(record_tasks))
+    assert unique_record_tasks, "No resolved task names in tuning records"
+
+    db_count, db_names = count_tuned_tasks_from_db(state.tuning_work_dir or "")
+    assert db_count == len(db_names), "DB tuned task count mismatch"
+    assert set(unique_record_tasks) == set(db_names), (
+        f"record tasks {unique_record_tasks} != DB names {db_names}"
+    )
+    print(f"  [PASS] DB task coverage matches record tasks: {db_count} tasks")
+
+    # Display-level consistency checks
+    from viz.schedule_display import candidate_cards_html, per_task_summary_html
+    from viz.charts import per_task_summary_chart, candidate_scatter_chart
+
+    cards_html = candidate_cards_html(records)
+    expected_cards_header = (
+        f"{len(records)} candidates across {len(unique_record_tasks)} task"
+    )
+    assert expected_cards_header in cards_html, "Card header count mismatch"
+
+    total_tasks = len(state.tuning_tasks)
+    summary_html = per_task_summary_html(records, total_tasks=total_tasks)
+    assert f"({len(unique_record_tasks)} tuned)" in summary_html, (
+        "Per-task summary tuned-count mismatch"
+    )
+    if total_tasks >= len(unique_record_tasks):
+        remaining = total_tasks - len(unique_record_tasks)
+        if remaining > 0:
+            assert f"{remaining} remaining tasks" in summary_html, (
+                "Per-task summary remaining-count mismatch"
+            )
+
+    cov_html = per_task_summary_chart(
+        total_tasks=total_tasks,
+        tuned_task_names=unique_record_tasks,
+        records=records,
+        return_format="html",
+    )
+    assert "img" in cov_html.lower(), "Per-task coverage chart did not render"
+
+    scatter_html = candidate_scatter_chart(records, return_format="html")
+    assert "img" in scatter_html.lower(), "Candidate scatter chart did not render"
+    print("  [PASS] Display summaries/charts are internally consistent")
+
+    # Stage 12 consistency
+    assert state.tvm_top5 and state.pytorch_top5, "Missing top-5 outputs"
+    assert state.tvm_top5[0]["class"] == state.pytorch_top5[0]["class"], (
+        "Top-1 class mismatch at final comparison"
+    )
+    assert state.max_abs_diff < 0.05, "Stage 12 diff outside expected range"
+    print("  [PASS] Final output consistency checks passed")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────
@@ -580,6 +680,7 @@ def main() -> None:
             test_select_best(state)             # Stage 10
             test_build(state)                   # Stage 11
             test_tvm_inference(state)           # Stage 12
+            test_end_to_end_consistency(state)  # cross-stage validity checks
         except RuntimeError as exc:
             log.error("TVM stage failed: %s", exc)
             print(f"\n  TVM stages skipped due to error: {exc}")

@@ -284,9 +284,24 @@ def test_fixup_main_task_names():
         ])
 
         records = [
-            {"candidate_id": 0, "task_name": "main", "run_ms": 10.0},
-            {"candidate_id": 1, "task_name": "main", "run_ms": 9.0},
-            {"candidate_id": 2, "task_name": "main", "run_ms": 2.0},
+            {
+                "candidate_id": 0,
+                "task_name": "main",
+                "run_ms": 10.0,
+                "trace_text": 'sch.get_sblock(name="conv2d_nchw", func_name="main")',
+            },
+            {
+                "candidate_id": 1,
+                "task_name": "main",
+                "run_ms": 9.0,
+                "trace_text": 'sch.get_sblock(name="conv2d_nchw", func_name="main")',
+            },
+            {
+                "candidate_id": 2,
+                "task_name": "main",
+                "run_ms": 2.0,
+                "trace_text": 'sch.get_sblock(name="add", func_name="main")',
+            },
         ]
 
         _fixup_main_task_names(records, tmpdir)
@@ -328,12 +343,30 @@ def test_stage8_stage9_consistency():
 
         # Stage 9 path: records with _fixup_main_task_names
         records = [
-            {"candidate_id": 0, "task_name": "main", "run_ms": 10.0},
-            {"candidate_id": 1, "task_name": "main", "run_ms": 9.0},
-            {"candidate_id": 2, "task_name": "main", "run_ms": 20.0},
-            {"candidate_id": 3, "task_name": "main", "run_ms": 3.0},
-            {"candidate_id": 4, "task_name": "main", "run_ms": 2.0},
-            {"candidate_id": 5, "task_name": "main", "run_ms": 1.0},
+            {
+                "candidate_id": 0, "task_name": "main", "run_ms": 10.0,
+                "trace_text": 'sch.get_sblock(name="conv2d_nchw_0", func_name="main")',
+            },
+            {
+                "candidate_id": 1, "task_name": "main", "run_ms": 9.0,
+                "trace_text": 'sch.get_sblock(name="conv2d_nchw_0", func_name="main")',
+            },
+            {
+                "candidate_id": 2, "task_name": "main", "run_ms": 20.0,
+                "trace_text": 'sch.get_sblock(name="conv2d_nchw_1", func_name="main")',
+            },
+            {
+                "candidate_id": 3, "task_name": "main", "run_ms": 3.0,
+                "trace_text": 'sch.get_sblock(name="add", func_name="main")',
+            },
+            {
+                "candidate_id": 4, "task_name": "main", "run_ms": 2.0,
+                "trace_text": 'sch.get_sblock(name="add", func_name="main")',
+            },
+            {
+                "candidate_id": 5, "task_name": "main", "run_ms": 1.0,
+                "trace_text": 'sch.get_sblock(name="mean", func_name="main")',
+            },
         ]
         _fixup_main_task_names(records, tmpdir)
 

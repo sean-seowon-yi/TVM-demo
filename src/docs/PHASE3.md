@@ -1,5 +1,7 @@
 # Phase 3 -- MetaSchedule Tuning
 
+> **Status note (2026-03-11):** Historical phase log. Some specifics may differ from current behavior after later fixes/refactors; use README.md + code as source of truth.
+
 > **Goal**: Implement the automated optimization loop -- task extraction,
 > schedule search, and cost-model-based selection -- along with three new
 > visualization modules for schedule traces, structural features, and

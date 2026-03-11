@@ -16,9 +16,9 @@ The demo runs on a machine with an **NVIDIA GPU** (or CPU fallback) and is acces
 4. **Applies graph-level passes** (LegalizeOps, AnnotateTIROpPattern, FuseOps, FuseTIR, DeadCodeElimination) and shows **before/after IR** for each pass.
 5. **Extracts lowered TIR operators** (PrimFuncs) and lets you inspect **TensorIR source** and **loop AST** for any operator.
 6. **Demonstrates Tensor Expressions** with a standalone conv2d “microscope” (compute vs. schedule separation).
-7. **Extracts tuning tasks** with MetaSchedule and runs **automated schedule search** (per-task candidate schedules, convergence chart).
+7. **Extracts tuning tasks** with MetaSchedule and runs **automated schedule search** (per-task candidate schedules and per-task coverage).
 8. **Summarizes tuned tasks** with per-task best schedules and coverage (which operators actually got optimized).
-9. **Explains the cost model** for the selected best candidates (structural features, paper Section 5.2).
+9. **Visualizes search-space exploration** in the cost-model tab (candidate scatter by task + per-task latency spread summary, with cost-model explanation text).
 10. **Builds the final CUDA module** (with DLight default GPU scheduling when MetaSchedule is unavailable) and **runs TVM inference**, comparing predictions and latency to PyTorch.
 
 All artifacts are **real**: IR snapshots, TIR, tuning records, and generated code come from TVM and PyTorch; the app is the “microscope” that makes them visible.
@@ -172,8 +172,8 @@ The app has **11 tabs**. Each tab corresponds to one or more **pipeline stages**
 | **5. Extracted Operators** | 5 | Table of TIR operators (name, shapes, op kind, block count); expandable TIR source | §3 → §4 |
 | **6. TensorIR / AST** | 6 | Per-PrimFunc TIR source, block/loop/buffer AST tree, loop table (extent, bindings) | §4, Fig. 13 |
 | **7. Tensor Expression** | 7 | Standalone conv2d TE compute, naive lowered TIR, and short explanation of compute/schedule separation | §4.1, Fig. 5 |
-| **8. Schedule Search** | 8–9 | Extracted tuning tasks, MetaSchedule tuning (or synthetic fallback), per-task candidate cards, convergence chart, per-task coverage | §5.1, §5.3, Fig. 12 |
-| **9. Cost Model** | 10 | Structural features table and cost-model explanation for the chosen best candidates (paper §5.2, Fig. 13) | §5.2, Fig. 13 |
+| **8. Schedule Search** | 8–9 | Extracted tuning tasks, MetaSchedule tuning (or synthetic fallback), per-task candidate cards, per-task coverage chart, per-task best-schedule summary | §5.1, §5.3 |
+| **9. Cost Model** | 10 | Candidate scatter across tasks, per-task latency spread table, and cost-model explanation card | §5.2, Fig. 13 |
 | **10. Build & Results** | 11–12 | Side-by-side predictions (PyTorch vs TVM), correctness verdict, 3-bar latency chart (PyTorch vs TVM live vs TVM precomputed), speedup, optional CUDA source | Fig. 2 bottom, §6, Fig. 14 |
 | **11. Pipeline Timeline** | 13 | Full pipeline as a vertical timeline with status and paper refs per stage | Fig. 2 (overview) |
 
@@ -223,8 +223,8 @@ TVM-demo/
 - **Stage 6**: For a chosen PrimFunc: TIR source and AST summary (blocks, loops, buffers).
 - **Stage 7**: Build a small TE/TOPI conv2d, show compute declaration and naive lowered TIR (microscope).
 - **Stage 8**: MetaSchedule task extraction (or manual extraction); list of tunable tasks and target.
-- **Stage 9**: Run tuning (or synthetic records if tuning unavailable); per-task candidate cards, convergence data, and task coverage summary.
-- **Stage 10**: Select best candidates by measured latency and explain the cost model; structural features table; cost-model explanation.
+- **Stage 9**: Run tuning (or synthetic records if tuning unavailable); per-task candidate cards and task-coverage summary.
+- **Stage 10**: Analyze search exploration by task (scatter + best/worst spread table) and show cost-model explanation.
 - **Stage 11**: Bind params, apply DLight if needed, build Relax module for CUDA (or LLVM); optionally capture generated CUDA source.
 - **Stage 12**: Run TVM inference, compare logits to PyTorch (max abs diff, cosine similarity), compare latency.
 - **Stage 13**: Timeline view of all stages and paper references.
@@ -239,13 +239,26 @@ Headless smoke test (no browser). Run from the **project root**:
 python -m src.tests.test_pipeline
 ```
 
-Use `--cpu` to run only PyTorch-only stages on CPU (no TVM/CUDA). The full run executes the entire pipeline (model load → inference → trace → import → passes → operators → TIR → TE → tuning → build → TVM inference → comparison) and checks correctness (e.g. max abs diff) and that latencies are produced. Tuning trial count is kept small so the test stays relatively fast.
+Use `--cpu` to run only PyTorch-only stages on CPU (no TVM/CUDA). The full run executes the entire pipeline (model load → inference → trace → import → passes → operators → TIR → TE → tuning → build → TVM inference → comparison) and checks correctness (e.g. max abs diff) and that latencies are produced. Tuning trial count is intentionally small in the smoke test so it stays relatively fast.
+
+Recent-fixes regression checks:
+
+```bash
+python tests/test_recent_fixes.py
+```
+
+Consistency-contract checks (cross-stage accounting + UI/report wording):
+
+```bash
+python tests/test_consistency_contracts.py
+```
 
 ---
 
 ## Tuning and Performance
 
 - **Tuning trials**: The slider defaults to **8 trials** (range 4-128) so the live demo stays fast (~1 min). Higher values improve performance but take longer.
+- **Requested vs actual trial count**: MetaSchedule's `max_trials_global` acts as a scheduler budget; the number of measured records can be slightly higher due to batch scheduling/rounding. The UI reports both requested budget and actual measured candidates.
 - **Precomputed high-trial results**: `precomputed_results.json` stores results from a longer tuning run (e.g. 128 trials). Tab 10 shows a **3-bar chart** (PyTorch vs TVM live vs TVM precomputed) to demonstrate how more tuning yields faster kernels -- without waiting during the presentation. Generate your own: `~/tvm_env/bin/python precompute_results.py --trials 128`
 - **Tuning logs**: MetaSchedule writes to `tuning_logs/` (in `.gitignore`).
 - **Fallbacks**: If MetaSchedule is unavailable, the app uses synthetic tuning records and DLight default GPU scheduling so stages 8-12 remain functional.

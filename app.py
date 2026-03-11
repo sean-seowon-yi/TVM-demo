@@ -476,12 +476,13 @@ def run_stage_8_9(max_trials: int):
         '<div style="width:20px;height:20px;border:3px solid #1976D2;border-top-color:transparent;'
         'border-radius:50%;animation:spin 1s linear infinite"></div>'
         f'<span style="font-size:15px;font-weight:600;color:#1565C0">'
-        f'MetaSchedule tuning in progress &mdash; {n_trials} trials across {len(task_dicts)} tasks</span></div>'
+        f'MetaSchedule tuning in progress &mdash; requested budget: {n_trials} trials across {len(task_dicts)} tasks</span></div>'
         f'<div style="font-size:13px;color:#555;margin-top:4px">'
         f'Heaviest tasks: {task_names} ...</div>'
         f'<div style="font-size:12px;color:#888;margin-top:8px">'
         f'The tuner measures schedule candidates on real hardware (GPU). '
-        f'Each trial compiles a variant, runs it, and records the latency.</div>'
+        f'Each trial compiles a variant, runs it, and records the latency. '
+        f'Final measured candidates can be slightly above this budget due to MetaSchedule batching.</div>'
         '<style>@keyframes spin{to{transform:rotate(360deg)}}</style></div>'
     )
 
@@ -558,8 +559,17 @@ def run_stage_8_9(max_trials: int):
 
     is_synthetic = any(r.get("_synthetic") for r in records)
     label = " (synthetic -- real tuning unavailable)" if is_synthetic else ""
+    actual = len(records)
+    budget_note = ""
+    if n_trials > 0:
+        delta = actual - n_trials
+        if delta > 0:
+            budget_note = f" (requested {n_trials}, actual {actual}, +{delta} batched)"
+        else:
+            budget_note = f" (requested {n_trials}, actual {actual})"
+
     tune_info = _ok(
-        f"{len(records)} candidates measured{label} &mdash; "
+        f"{actual} candidates measured{label}{budget_note} &mdash; "
         f"<b>{covered} of {total}</b> tasks tuned: "
         f"{', '.join(covered_names) if covered_names else 'none'}"
     )
@@ -578,9 +588,13 @@ def run_stage_10() -> tuple:
     from viz.charts import candidate_scatter_chart
     from viz.feature_table import cost_model_explanation_html
 
+    requested = STATE.tuning_trials_used or 0
+    actual = len(STATE.tuning_records)
+    req_label = f", requested budget {requested}" if requested else ""
+
     scatter = candidate_scatter_chart(
         STATE.tuning_records,
-        title=f"Search Exploration ({len(STATE.tuning_records)} candidates across {STATE.tuning_tasks_covered} tasks)",
+        title=f"Search Exploration ({actual} measured candidates across {STATE.tuning_tasks_covered} tasks{req_label})",
     )
     explanation = cost_model_explanation_html()
 
@@ -615,7 +629,10 @@ def run_stage_10() -> tuple:
     else:
         insight_md += "*No valid measurements to analyze.*\n"
 
-    status = _ok(f"Analyzed {len(valid)} candidates across {len(task_stats)} tasks")
+    status = _ok(
+        f"Analyzed {len(valid)} valid measured candidates across {len(task_stats)} tasks"
+        + (f" (requested budget {requested})" if requested else "")
+    )
     return status, scatter, insight_md, explanation, _progress_html()
 
 
