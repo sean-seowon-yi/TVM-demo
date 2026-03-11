@@ -704,7 +704,15 @@ def run_stage_11_12() -> tuple:
         if precomputed:
             pre_trials = precomputed.get("tuning_trials", 512)
             pre_ms = precomputed["tvm_latency_ms"]
-            pre_speedup = precomputed["speedup"]
+            # Compute speedup against the CURRENT run's PyTorch baseline.
+            # The precomputed JSON may include a historical speedup measured
+            # against an older PyTorch baseline on a different environment.
+            pre_speedup = (
+                STATE.pytorch_latency_ms / pre_ms
+                if pre_ms and pre_ms > 0
+                else 0.0
+            )
+            recorded_pre_speedup = precomputed.get("speedup")
 
             import torch as _torch
             _gpu_label = _torch.cuda.get_device_name(0) if _torch.cuda.is_available() else "GPU"
@@ -732,6 +740,11 @@ def run_stage_11_12() -> tuple:
                 f"| **vs PyTorch** | -- | {live_vs_pt}x | **{pre_speedup}x** |\n"
                 f"| **Tasks tuned** | N/A (cuDNN) | **{live_covered} of {total_tasks}** | **{pre_tasks_tuned} of {total_tasks}** |\n\n"
             )
+            if recorded_pre_speedup:
+                comparison_md += (
+                    f"> Note: precomputed file also stores a historical speedup "
+                    f"({recorded_pre_speedup}x) from its original baseline run.\n\n"
+                )
 
             if live_vs_pt < 1:
                 comparison_md += (
@@ -772,11 +785,21 @@ def run_stage_11_12() -> tuple:
         }
 
         precomputed = _load_precomputed(STATE.model_name)
-        pre_speedup = precomputed["speedup"] if precomputed else None
+        pre_speedup = None
+        pre_trials = None
+        if precomputed:
+            pre_trials = precomputed.get("tuning_trials")
+            pre_ms = precomputed.get("tvm_latency_ms", 0.0)
+            if pre_ms and pre_ms > 0:
+                pre_speedup = STATE.pytorch_latency_ms / pre_ms
 
         if comp_data["match"]:
             live_line = f'Live: {comp_data["speedup"]:.2f}x vs PyTorch'
-            tuned_line = f' | Tuned ({precomputed["tuning_trials"]} trials): <b>{pre_speedup}x</b>' if pre_speedup else ""
+            tuned_line = (
+                f' | Tuned ({pre_trials} trials): <b>{pre_speedup:.2f}x</b> vs current PyTorch'
+                if pre_speedup and pre_trials
+                else ""
+            )
             done_html = (
                 '<div style="background:linear-gradient(135deg,#1B5E20,#2E7D32);'
                 'color:#fff;border-radius:12px;padding:24px;margin:12px 0;text-align:center">'
